@@ -1,0 +1,223 @@
+             **********
+             * WHENCE *
+             **********
+
+This file attempts to document the origin and licensing information,
+if known, for each piece of firmware distributed for use with the Linux
+kernel.
+
+--------------------------------------------------------------------------
+
+Driver: cxgb4 - Chelsio Terminator 4/5/6 1/10/25/40/100G Ethernet adapter
+
+File: cxgb4/t4fw-1.14.4.0.bin
+File: cxgb4/t4fw-1.15.37.0.bin
+File: cxgb4/t4fw-1.27.5.0.bin
+Link: cxgb4/t4fw.bin -> t4fw-1.27.5.0.bin
+File: cxgb4/t5fw-1.14.4.0.bin
+File: cxgb4/t5fw-1.15.37.0.bin
+File: cxgb4/t5fw-1.27.5.0.bin
+Link: cxgb4/t5fw.bin -> t5fw-1.27.5.0.bin
+File: cxgb4/t6fw-1.27.5.0.bin
+Link: cxgb4/t6fw.bin -> t6fw-1.27.5.0.bin
+File: cxgb4/aq1202_fw.cld
+File: cxgb4/bcm8483.bin
+File: cxgb4/configs/t4-config-default.txt
+File: cxgb4/configs/t5-config-default.txt
+File: cxgb4/configs/t6-config-default.txt
+File: cxgb4/configs/t5-config-hashfilter.txt
+File: cxgb4/configs/t6-config-hashfilter.txt
+Link: cxgb4/t4-config.txt -> configs/t4-config-default.txt
+Link: cxgb4/t5-config.txt -> configs/t5-config-default.txt
+Link: cxgb4/t6-config.txt -> configs/t6-config-default.txt
+
+Licence: Redistributable. See LICENCE.chelsio_firmware for details
+
+--------------------------------------------------------------------------
+
+Driver: tg3 - Broadcom Tigon3 based gigabit Ethernet cards
+
+File: tigon/tg3.bin
+File: tigon/tg3_tso.bin
+File: tigon/tg3_tso5.bin
+File: tigon/tg357766.bin
+
+Licence: Redistributable. See LICENCE.tigon for details
+
+Found in hex form in kernel source.
+
+--------------------------------------------------------------------------
+
+Driver: bnx2x - Broadcom Everest
+
+File: bnx2x/bnx2x-e1-7.13.1.0.fw
+File: bnx2x/bnx2x-e1-7.13.11.0.fw
+File: bnx2x/bnx2x-e1-7.13.15.0.fw
+File: bnx2x/bnx2x-e1-7.13.21.0.fw
+File: bnx2x/bnx2x-e1h-7.13.1.0.fw
+File: bnx2x/bnx2x-e1h-7.13.11.0.fw
+File: bnx2x/bnx2x-e1h-7.13.15.0.fw
+File: bnx2x/bnx2x-e1h-7.13.21.0.fw
+File: bnx2x/bnx2x-e2-7.13.1.0.fw
+File: bnx2x/bnx2x-e2-7.13.11.0.fw
+File: bnx2x/bnx2x-e2-7.13.15.0.fw
+File: bnx2x/bnx2x-e2-7.13.21.0.fw
+
+License: Redistributable. See LICENCE.bnx2x for details.
+
+Found in hex form in kernel source.
+
+--------------------------------------------------------------------------
+
+Driver: bnx2 - Broadcom NetXtremeII
+
+File: bnx2/bnx2-mips-06-6.2.3.fw
+File: bnx2/bnx2-mips-09-6.2.1b.fw
+File: bnx2/bnx2-rv2p-06-6.0.15.fw
+File: bnx2/bnx2-rv2p-09-6.0.17.fw
+File: bnx2/bnx2-rv2p-09ax-6.0.17.fw
+
+License: Redistributable. See LICENCE.bnx2 for details.
+
+Found in hex form in kernel source.
+
+--------------------------------------------------------------------------
+
+Driver: qed - QLogic 4xxxx Ethernet Driver Core Module.
+
+File: qed/qed_init_values_zipped-8.4.2.0.bin
+File: qed/qed_init_values_zipped-8.7.3.0.bin
+File: qed/qed_init_values_zipped-8.10.5.0.bin
+File: qed/qed_init_values-8.10.9.0.bin
+File: qed/qed_init_values_zipped-8.10.10.0.bin
+File: qed/qed_init_values-8.14.6.0.bin
+File: qed/qed_init_values_zipped-8.15.3.0.bin
+File: qed/qed_init_values-8.18.9.0.bin
+File: qed/qed_init_values_zipped-8.20.0.0.bin
+File: qed/qed_init_values-8.20.0.0.bin
+File: qed/qed_init_values-8.30.12.0.bin
+File: qed/qed_init_values_zipped-8.33.1.0.bin
+File: qed/qed_init_values_zipped-8.33.11.0.bin
+File: qed/qed_init_values-8.33.12.0.bin
+File: qed/qed_init_values_zipped-8.37.2.0.bin
+File: qed/qed_init_values_zipped-8.37.7.0.bin
+File: qed/qed_init_values-8.37.7.0.bin
+File: qed/qed_init_values-8.40.33.0.bin
+File: qed/qed_init_values_zipped-8.42.2.0.bin
+File: qed/qed_init_values_zipped-8.59.1.0.bin
+
+Licence: Redistributable. See LICENSE.qed for details.
+
+--------------------------------------------------------------------------
+
+Driver: r8169 - RealTek 8169/8168/8101 ethernet driver.
+
+File: rtl_nic/rtl8168d-1.fw
+File: rtl_nic/rtl8168d-2.fw
+File: rtl_nic/rtl8105e-1.fw
+File: rtl_nic/rtl8168e-1.fw
+File: rtl_nic/rtl8168e-2.fw
+
+File: rtl_nic/rtl8168e-3.fw
+Version: 0.0.4
+
+File: rtl_nic/rtl8168f-1.fw
+Version: 0.0.5
+
+File: rtl_nic/rtl8168f-2.fw
+Version: 0.0.4
+
+File: rtl_nic/rtl8411-1.fw
+Version: 0.0.3
+
+File: rtl_nic/rtl8411-2.fw
+Version: 0.0.1
+
+File: rtl_nic/rtl8402-1.fw
+Version: 0.0.1
+
+File: rtl_nic/rtl8106e-1.fw
+Version: 0.0.1
+
+File: rtl_nic/rtl8106e-2.fw
+Version: 0.0.1
+
+File: rtl_nic/rtl8168g-1.fw
+Version: 0.0.3
+
+File: rtl_nic/rtl8168g-2.fw
+Version: 0.0.1
+
+File: rtl_nic/rtl8168g-3.fw
+Version: 0.0.1
+
+File: rtl_nic/rtl8168h-1.fw
+Version: 0.0.2
+
+File: rtl_nic/rtl8168h-2.fw
+Version: 0.0.2
+
+File: rtl_nic/rtl8168fp-3.fw
+Version: 0.0.1
+
+File: rtl_nic/rtl8107e-1.fw
+Version: 0.0.2
+
+File: rtl_nic/rtl8107e-2.fw
+Version: 0.0.2
+
+File: rtl_nic/rtl8125a-3.fw
+Version: 0.0.1
+
+File: rtl_nic/rtl8125b-1.fw
+Version: 0.0.2
+
+File: rtl_nic/rtl8125b-2.fw
+Version: 0.0.2
+
+File: rtl_nic/rtl8125d-1.fw
+Version: 0.0.7
+
+File: rtl_nic/rtl8125d-2.fw
+Version: 0.0.4
+
+File: rtl_nic/rtl8125k-1.fw
+Version: 0.0.1
+
+File: rtl_nic/rtl8125cp-1.fw
+Version: 0.0.1
+
+File: rtl_nic/rtl9151a-1.fw
+Version: 0.0.1
+
+File: rtl_nic/rtl8126a-2.fw
+Version: 0.0.2
+
+File: rtl_nic/rtl8125bp-2.fw
+Version: 0.0.4
+
+File: rtl_nic/rtl8126a-3.fw
+Version: 0.0.5
+
+File: rtl_nic/rtl8127a-1.fw
+Version: 0.0.5
+
+Licence: Redistributable. See LICENSE.r8169 for details.
+
+--------------------------------------------------------------------------
+
+Driver: ice - Intel(R) Ethernet Connection E800 Series
+
+File: intel/ice/ddp/ice-1.3.43.0.pkg
+Link: intel/ice/ddp/ice.pkg -> ice-1.3.43.0.pkg
+File: intel/ice/ddp-lag/ice_lag-1.3.2.0.pkg
+
+License: Redistributable. See LICENSE.ice for details
+
+File: intel/ice/ddp-comms/ice_comms-1.3.55.0.pkg
+File: intel/ice/ddp-wireless_edge/ice_wireless_edge-1.3.23.0.pkg
+
+License: Redistributable. See LICENSE.ice_enhanced for details
+
+--------------------------------------------------------------------------
+

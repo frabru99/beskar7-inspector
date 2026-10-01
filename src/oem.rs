@@ -312,6 +312,62 @@ mod tests {
     }
 
     #[test]
+    fn find_oem_returns_the_labeled_nvme_partition() {
+        // A Kairos image on an NVMe namespace: partitions are nvme0n1p<N>, with
+        // the `p` separator. The real /sys/block/nvme0n1/ also holds `mq`,
+        // `holders`, `slaves` and `power` beside `queue`/`device`; none is a
+        // partition, and the disk itself is never one of its own partitions.
+        let s = Scratch::new("oem-nvme");
+        write_disk_with_partitions(
+            s.path(),
+            "nvme0n1",
+            &["nvme0n1p1", "nvme0n1p2", "nvme0n1p3", "nvme0n1p4"],
+        );
+        for sibling in [
+            "mq/0/cpu_list",
+            "holders/.keep",
+            "slaves/.keep",
+            "power/control",
+        ] {
+            write(s.path(), &format!("nvme0n1/{sibling}"), "\n");
+        }
+        assert_eq!(
+            target_partitions(s.path(), "nvme0n1"),
+            vec!["nvme0n1p1", "nvme0n1p2", "nvme0n1p3", "nvme0n1p4"]
+        );
+
+        // p1 = EFI (vfat), p2 = COS_OEM, p3 = COS_RECOVERY, p4 = COS_STATE.
+        let labels = HashMap::from([
+            ("nvme0n1p1", None),
+            ("nvme0n1p2", Some("COS_OEM".to_string())),
+            ("nvme0n1p3", Some("COS_RECOVERY".to_string())),
+            ("nvme0n1p4", Some("COS_STATE".to_string())),
+        ]);
+        let got = find_oem_in(s.path(), "nvme0n1", |p| labels.get(p).cloned().flatten()).unwrap();
+        assert_eq!(got.kname, "nvme0n1p2");
+        assert_eq!(got.dev_path(), "/dev/nvme0n1p2");
+        assert_eq!(got.dev_number, "259:2");
+    }
+
+    #[test]
+    fn find_oem_on_a_bare_nvme_namespace_reports_no_partitions() {
+        // A namespace whose partition table has not been re-read yet: only the
+        // disk's own attributes, which must not be taken for partitions.
+        let s = Scratch::new("oem-nvme-bare");
+        write(s.path(), "nvme0n1/queue/rotational", "0\n");
+        write(s.path(), "nvme0n1/size", "1000\n");
+        write(s.path(), "nvme0n1/dev", "259:0\n");
+        write(s.path(), "nvme0n1/device/model", "QEMU NVMe Ctrl\n");
+        let err = find_oem_in(s.path(), "nvme0n1", |_| Some("COS_OEM".to_string())).unwrap_err();
+        assert_eq!(
+            err,
+            OemError::NoPartitions {
+                disk: "nvme0n1".into()
+            }
+        );
+    }
+
+    #[test]
     fn find_oem_aborts_when_no_partition_is_labeled_cos_oem() {
         let s = Scratch::new("oem-absent");
         write_disk_with_partitions(s.path(), "sda", &["sda1", "sda2"]);

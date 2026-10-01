@@ -93,6 +93,63 @@ digest-pinning trust model, and the disk/`COS_OEM` behavior — is specified in
 in the beskar7 repo (the **source of truth**). This repo implements contract
 **v4.2** (`CONTRACT_VERSION` in `src/lib.rs`).
 
+## Hardware support
+
+The image boots Alpine's `linux-lts` kernel, which builds its storage and network
+drivers as modules. The initramfs ships a curated set of them
+([`modules.list`](modules.list)) and loads all of them at startup. A driver whose
+hardware is absent binds nothing.
+
+| Kind | Families | Drivers |
+|---|---|---|
+| Storage | SATA (AHCI; legacy Intel PIIX/ICH) | `ahci`, `ata_piix` |
+| | NVMe | `nvme` |
+| | SAS HBAs and RAID: Broadcom/LSI MegaRAID, SAS2/SAS3 HBAs, SAS4 Tri-Mode; Microchip SmartPQI (HPE Smart Array Gen10+); HPE Smart Array before Gen10; Adaptec | `megaraid_sas`, `mpt3sas`, `mpi3mr`, `smartpqi`, `hpsa`, `aacraid` |
+| | SCSI disks (SATA, SAS and RAID volumes appear as `/dev/sdX`) | `sd_mod` |
+| | Virtual: virtio, VMware PVSCSI | `virtio_blk`, `virtio_scsi`, `vmw_pvscsi` |
+| Network | Intel 1/2.5/10/25/40/100GbE | `e1000`, `e1000e`, `igb`, `igc`, `ixgbe`, `i40e`, `ice` |
+| | Broadcom NetXtreme, NetXtreme II, NetXtreme-C/E | `tg3`, `bnx2`, `bnx2x`, `bnxt_en` |
+| | NVIDIA/Mellanox ConnectX-3 and ConnectX-4+ | `mlx4_en`, `mlx5_core` |
+| | Realtek | `r8169` |
+| | Marvell/QLogic FastLinQ, Emulex OneConnect, Marvell/Aquantia AQtion, AMD/Solarflare, Chelsio T4–T6, Cisco UCS VIC | `qede`, `be2net`, `atlantic`, `sfc`, `cxgb4`, `enic` |
+| | Virtual: virtio, VMware vmxnet3 | `virtio_net`, `vmxnet3` |
+| Filesystem | ext4 (for the image's `COS_OEM` partition) | `ext4` |
+
+Drivers that need device firmware get it from the image. At build time, every
+firmware file the shipped modules declare is copied into `/lib/firmware`, where
+the kernel loads it directly.
+
+So far the image has been boot-tested only on QEMU's emulated NVMe, AHCI, PIIX
+and PVSCSI controllers and its igb, e1000e, e1000, vmxnet3 and virtio NICs. The
+other drivers are the kernel's upstream drivers and have not been tested on real
+hardware by this project.
+
+**If your NIC or storage controller is missing,** the console shows
+`no network interface found` or `no eligible target disk found`. Please
+[open an issue](https://github.com/projectbeskar/beskar7-inspector/issues) and
+include the output of `lspci -nn` from that host. Boot any Linux live image to
+get it.
+
+### Firmware licensing
+
+The firmware in `initrd.img` is not covered by this project's Apache-2.0
+license. It comes unmodified (only decompressed) from Alpine's `linux-firmware-*`
+packages, which repackage the upstream
+[linux-firmware](https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git)
+repository. Each file is redistributed under the terms its vendor set.
+
+Those license texts ship with the firmware. They are vendored in
+[`firmware-licenses/`](firmware-licenses/): the `LICENCE.*`/`LICENSE.*` files,
+plus the `WHENCE` entries that map each shipped file to its license. Their
+upstream source and tag are recorded in that directory's README. The texts are
+copied:
+
+- into `initrd.img` at `/lib/firmware/LICENSES/`, beside the firmware;
+- into the container image at `/firmware-licenses/`.
+
+The image build fails if it would ship a firmware file that those `WHENCE`
+entries do not cover.
+
 ## Security posture
 
 - **Verified TLS** to the callback (rustls, CA delivered on the cmdline); no
@@ -120,8 +177,8 @@ make test-vm                                   # boot the image in QEMU (Phase 1
 
 `make image` produces the two boot files (`build/vmlinuz`, `build/initrd.img`)
 from the multi-stage `Dockerfile`: it builds the static binary, assembles a
-minimal initramfs (the binary as `/init`, the curated kernel modules, and the
-mountpoints it needs), and
+minimal initramfs (the binary as `/init`, the curated kernel modules and the
+firmware they declare, and the mountpoints it needs), and
 takes the kernel from Alpine's `linux-lts`. An operator serves these two files to
 the boot infrastructure the controller's iPXE script points at.
 
@@ -147,4 +204,6 @@ src/deploy.rs       whole-disk write + COS_OEM mount/inject + reboot
 src/run.rs          the PID-1 two-phase pipeline
 src/main.rs         thin PID-1 entrypoint over run::run
 tests/contract.rs   golden-fixture report round-trip (shared with beskar7)
+modules.list        the curated kernel modules the image ships
+firmware-licenses/  licence texts + WHENCE mapping for the shipped firmware
 ```

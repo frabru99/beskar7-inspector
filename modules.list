@@ -3,32 +3,95 @@
 # These are *base* module names; the Dockerfile resolves transitive dependencies
 # and load order at build time (depmod / `modprobe --show-depends`) and ships the
 # result, uncompressed, plus an ordered `beskar7.load` the binary finit_module's.
-# Built-in drivers (already in the kernel) are skipped at build time.
+# Built-in drivers (already in the kernel) are skipped at build time. An entry
+# that does not resolve against the kernel fails the build.
 #
-# This is the Smoke 0/1 slice: virtio (QEMU/KVM) + ahci/e1000 (legacy QEMU) +
-# ext4 (mandatory — the COS_OEM partition the inspector mounts is ext). The broad
-# bare-metal NIC/HBA set + a PCI-modalias coldplug pass are a deliberate
-# follow-up (see D-012); they are not needed for the QEMU smoke loop.
+# The whole set ships and is loaded unconditionally: the loader is best-effort,
+# and a driver whose hardware is absent simply binds nothing. The firmware these
+# drivers declare (`modinfo -F firmware`) ships with them under /lib/firmware.
+# Loading only the drivers whose PCI modalias matches present hardware (coldplug)
+# would trim boot time, but is an optional later optimisation, not a requirement.
+#
+# A NIC or HBA missing from this list is invisible to the inspector: on bare
+# metal the run stops at "no network interface found" or "no eligible target
+# disk". To add one, append its base module name here.
 
-# Storage + bus (virtio for QEMU/KVM)
+# ---- Storage ----------------------------------------------------------------
+
+# virtio (QEMU/KVM guests)
 virtio_pci
 virtio_blk
 virtio_scsi
 
-# Storage (legacy/QEMU + common bare metal)
+# SATA: AHCI controllers (and QEMU q35), plus legacy Intel PIIX/ICH SATA/IDE
+# (and QEMU i440fx)
 ahci
+ata_piix
+# SCSI disk driver: SATA, SAS and RAID volumes all surface as /dev/sdX through
+# it — without sd_mod an HBA is detected but no disk appears.
+sd_mod
 
-# Networking (QEMU + Intel 1GbE on real hardware)
+# NVMe SSDs (/dev/nvmeXnY)
+nvme
+
+# SAS HBAs and RAID controllers: Broadcom/LSI MegaRAID (Dell PERC, Lenovo,
+# Fujitsu), LSI/Broadcom SAS2/SAS3 HBAs (mpt3sas) and SAS4 Tri-Mode (mpi3mr),
+# Microchip SmartPQI (HPE Gen10+ Smart Array), HPE Smart Array before Gen10
+# (hpsa), Adaptec, and VMware's paravirtual SCSI
+megaraid_sas
+mpt3sas
+mpi3mr
+smartpqi
+hpsa
+aacraid
+vmw_pvscsi
+
+# ---- Networking -------------------------------------------------------------
+
+# virtio (QEMU/KVM guests)
 virtio_net
-e1000
-# e1000e is a SEPARATE driver from e1000, not a variant of it: e1000 covers the
-# PCI 8254x parts QEMU emulates, e1000e the PCIe 82571+ / I217 / I218 / I219
-# parts most Intel-based servers and workstations actually ship. Without it such
-# a host PXE-boots, loads no NIC driver, and sits in an iPXE retry loop with
-# nothing obviously wrong — found 2026-09-14 on a host that had to be switched to
-# virtio to be testable at all. First entry from the broad bare-metal NIC set the
-# header defers; the rest still is deferred.
-e1000e
 
-# Filesystem — mandatory: COS_OEM (and the deploy mount) is ext2/3/4
+# Intel. e1000 covers the PCI 8254x parts QEMU emulates; e1000e is a SEPARATE
+# driver for the PCIe 82571+ / I217 / I218 / I219 parts most Intel-based servers
+# and workstations ship (found 2026-09-14 on a host that PXE-booted, loaded no
+# NIC driver, and sat in an iPXE retry loop). igb: 82575/82576/I350/I210 1GbE;
+# igc: I225/I226 2.5GbE; ixgbe: 82599/X520/X540/X550 10GbE; i40e: X710/XL710/
+# XXV710 (Ethernet 700 series); ice: E810 (Ethernet 800 series).
+e1000
+e1000e
+igb
+igc
+ixgbe
+i40e
+ice
+
+# Broadcom: tg3 (NetXtreme BCM57xx 1GbE), bnx2 / bnx2x (NetXtreme II 1/10GbE),
+# bnxt_en (NetXtreme-C/E 10–200GbE)
+tg3
+bnx2
+bnx2x
+bnxt_en
+
+# NVIDIA/Mellanox ConnectX: mlx4_en (ConnectX-3), mlx5_core (ConnectX-4 and
+# later, incl. its Ethernet function)
+mlx4_en
+mlx5_core
+
+# Realtek 1/2.5/5GbE (r8169 also drives the RTL8125/8126 parts)
+r8169
+
+# Marvell/QLogic FastLinQ (qede), Emulex OneConnect (be2net), Marvell/Aquantia
+# AQtion (atlantic), AMD/Solarflare (sfc), Chelsio T4–T6 (cxgb4), Cisco UCS VIC
+# (enic), VMware's paravirtual NIC (vmxnet3)
+qede
+be2net
+atlantic
+sfc
+cxgb4
+enic
+vmxnet3
+
+# ---- Filesystem -------------------------------------------------------------
+
+# Mandatory: COS_OEM (and the deploy mount) is ext2/3/4
 ext4

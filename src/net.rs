@@ -401,15 +401,7 @@ pub fn write_resolv_conf(dns: &[Ipv4Addr]) -> std::io::Result<()> {
 /// non-loopback NIC, pins it; with several and no `BOOTIF`, returns them all to be
 /// raced. Pure over the directory, so the selection policy is unit-tested.
 fn select_nics(net_dir: &Path, bootif: Option<&str>) -> Result<NicSelection, NetError> {
-    let mut candidates: Vec<String> = match std::fs::read_dir(net_dir) {
-        Ok(rd) => rd
-            .flatten()
-            .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|name| name != "lo")
-            .collect(),
-        Err(_) => return Err(NetError::NoInterface),
-    };
-    candidates.sort();
+    let candidates = candidate_interfaces(net_dir);
     if candidates.is_empty() {
         return Err(NetError::NoInterface);
     }
@@ -430,6 +422,30 @@ fn select_nics(net_dir: &Path, bootif: Option<&str>) -> Result<NicSelection, Net
         [only] => Ok(NicSelection::Pinned(only.clone())),
         _ => Ok(NicSelection::Race(candidates)),
     }
+}
+
+/// Whether [`select_nics`] would succeed against `net_dir` now: the `BOOTIF`
+/// interface exists when `bootif` pins one, otherwise any candidate does. The
+/// post-module-load settle wait ([`crate::modules`]) waits for exactly this, so
+/// it holds out for the NIC that PXE-booted rather than the first to register.
+pub(crate) fn nic_selectable(net_dir: &Path, bootif: Option<&str>) -> bool {
+    select_nics(net_dir, bootif).is_ok()
+}
+
+/// The interfaces NIC selection chooses from: every `net_dir` entry except
+/// loopback, sorted so the race tie-break is deterministic. Empty when the
+/// directory cannot be read.
+pub(crate) fn candidate_interfaces(net_dir: &Path) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(net_dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = rd
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| name != "lo")
+        .collect();
+    names.sort();
+    names
 }
 
 /// Normalize a `BOOTIF` value to a lowercase colon-separated MAC. pxelinux/iPXE

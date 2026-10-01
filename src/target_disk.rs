@@ -916,6 +916,61 @@ Filename				Type		Size	Used	Priority
         assert_eq!(strip_partition_suffix("sda"), "sda");
     }
 
+    #[test]
+    fn strip_partition_suffix_handles_multi_digit_nvme_names() {
+        // Controller, namespace and partition numbers can all exceed 9; only the
+        // trailing `p<N>` is stripped, never the namespace's `n<N>`.
+        assert_eq!(strip_partition_suffix("nvme0n1p12"), "nvme0n1");
+        assert_eq!(strip_partition_suffix("nvme10n2p1"), "nvme10n2");
+        assert_eq!(strip_partition_suffix("nvme1n12p3"), "nvme1n12");
+    }
+
+    // --- NVMe end to end ------------------------------------------------------
+
+    #[test]
+    fn nvme_whole_disk_with_partitions_is_selected_not_a_partition() {
+        // After a prior deploy the NVMe namespace carries partitions. They live
+        // under /sys/block/nvme0n1/ (never top-level), so the candidate is the
+        // whole disk nvme0n1 — which, ending in a digit, must not be read as a
+        // partition of some "nvme0n" disk.
+        let s = Scratch::new("nvme-whole");
+        write_disk(s.path(), "nvme0n1", 480, false, false);
+        for p in ["nvme0n1p1", "nvme0n1p2", "nvme0n1p3"] {
+            write_partition(s.path(), "nvme0n1", p);
+        }
+        let class = Scratch::new("nvme-whole-class");
+        for p in ["nvme0n1p1", "nvme0n1p2", "nvme0n1p3"] {
+            write(class.path(), &format!("{p}/partition"), "1\n");
+        }
+
+        let names: Vec<String> = enumerate(s.path()).into_iter().map(|c| c.kname).collect();
+        assert_eq!(names, vec!["nvme0n1"]);
+        let auto = select_core(s.path(), class.path(), None, 0, &no_ramdisk()).expect("a disk");
+        assert_eq!(auto.kname, "nvme0n1");
+        assert_eq!(auto.dev_path(), "/dev/nvme0n1");
+        let pinned =
+            select_core(s.path(), class.path(), Some("nvme0n1"), 0, &no_ramdisk()).expect("disk");
+        assert_eq!(pinned.kname, "nvme0n1");
+    }
+
+    #[test]
+    fn pinned_nvme_partition_is_rejected_as_not_whole_disk() {
+        let s = Scratch::new("pin-nvme-part");
+        write_disk(s.path(), "nvme0n1", 960, false, false);
+        write_partition(s.path(), "nvme0n1", "nvme0n1p3");
+        let class = Scratch::new("pin-nvme-part-class");
+        write(class.path(), "nvme0n1p3/partition", "1\n");
+
+        let err =
+            select_core(s.path(), class.path(), Some("nvme0n1p3"), 0, &no_ramdisk()).unwrap_err();
+        assert_eq!(
+            err,
+            DiskError::PinNotWholeDisk {
+                kname: "nvme0n1p3".to_string()
+            }
+        );
+    }
+
     // --- pin resolution -----------------------------------------------------
 
     #[test]

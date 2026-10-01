@@ -108,21 +108,24 @@ pub enum RunError {
 pub fn run(dry_run: bool) -> Result<(), RunError> {
     if !dry_run {
         mount_pseudo_filesystems()?;
-        // Load the curated storage/network/fs drivers so /sys/block and
-        // /sys/class/net are populated before probing, and ext4 is available for
-        // the COS_OEM mount (D-012). Best-effort; must run after /proc,/sys,/dev
-        // are mounted and before the probe reads /sys.
-        crate::modules::load_drivers();
         // Pin all current and future pages so the in-RAM secrets (token,
         // user-data) can never be paged to swap — making §9's swapless guarantee
-        // a runtime invariant rather than a deployment assumption. Best-effort: a
-        // host without CAP_IPC_LOCK falls back to the swapless-ramdisk assumption.
+        // a runtime invariant rather than a deployment assumption. Before the
+        // cmdline parse, so the token is never held in unlocked memory.
+        // Best-effort: a host without CAP_IPC_LOCK falls back to the
+        // swapless-ramdisk assumption.
         lock_memory();
     }
 
     let params = BootParams::from_proc_cmdline()?;
 
     if !dry_run {
+        // Load the curated storage/network/fs drivers so /sys/block and
+        // /sys/class/net are populated before probing, and ext4 is available for
+        // the COS_OEM mount (D-012). Best-effort; must run after /proc,/sys,/dev
+        // are mounted and before the probe reads /sys. It takes BOOTIF so its
+        // settle wait holds out for the NIC that PXE-booted, not just any NIC.
+        crate::modules::load_drivers(params.bootif.as_deref());
         // Bring up the provisioning NIC (DHCP) so the callback is reachable — the
         // NIC driver was loaded above, but the link is down and unaddressed, and
         // kernel ip=dhcp can't help with a module loaded post-boot (D-013). Needs
