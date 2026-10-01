@@ -169,30 +169,23 @@ pub fn run(dry_run: bool) -> Result<(), RunError> {
     }
 
     // ── Phase 2: provision (when bootstrap data is ready) ───────────────────
-    let target = target?; // a missing target disk is fatal for provisioning
+    // A missing target disk is fatal for provisioning. It is reported before the
+    // bootstrap poll: no disk appears later (there is no hotplug window), and the
+    // controller, which has the report, would otherwise wait out its deployment
+    // timeout.
+    let target = require_target(target, |reason| client.provision_failed(reason))?;
     let max_polls = poll_budget_iterations(params.timeout);
     let user_data = Zeroizing::new(poll_bootstrap(max_polls, sleep, || {
         client.fetch_bootstrap()
     })?);
     eprintln!("beskar7-inspector: bootstrap data received, provisioning");
 
-    // The destructive deploy steps. The host has already moved to Deploying (the
-    // inspection POST succeeded), so a failure here is reported to the controller
-    // via the provision-failed callback (D-015 v4.1) — best-effort, before the
-    // existing abort/halt — so the controller fails the machine promptly instead of
-    // waiting out its deployment timeout.
+    // The destructive deploy steps. A failure is reported to the controller
+    // before the existing abort/halt, like a missing disk above.
     if let Err(e) = run_deploy_steps(&target, &params, &user_data) {
-        let reason = deploy_failure_reason(&e);
-        if let Err(cb) = client.provision_failed(reason) {
-            // Best-effort: a failed callback (after its own retries) must NOT loop
-            // or mask the deploy error — log the non-secret callback error and fall
-            // through to propagating the original deploy failure (which parks PID 1
-            // so the controller still times the host out).
-            eprintln!("beskar7-inspector: provision-failed callback did not land: {cb}");
-        } else {
-            eprintln!("beskar7-inspector: provision-failed callback accepted ({reason})");
-        }
-        return Err(e);
+        return Err(report_provision_failure(e, |reason| {
+            client.provision_failed(reason)
+        }));
     }
 
     // Zero the join secret before handing control to the firmware (§9.1 step 6).
@@ -213,12 +206,38 @@ pub fn run(dry_run: bool) -> Result<(), RunError> {
     Err(RunError::Deploy(deploy::reboot_now()))
 }
 
+/// The target disk Phase 2 deploys to, or — when selection failed — the failure,
+/// after reporting it through `provision_failed` ([`report_provision_failure`]).
+fn require_target(
+    target: Result<crate::target_disk::TargetDisk, DiskError>,
+    provision_failed: impl FnOnce(&'static str) -> Result<(), ClientError>,
+) -> Result<crate::target_disk::TargetDisk, RunError> {
+    target.map_err(|e| report_provision_failure(e.into(), provision_failed))
+}
+
+/// Report a Phase 2 failure through the provision-failed callback (D-015 v4.1),
+/// then hand the failure back to propagate. The inspection report was accepted,
+/// so the controller is waiting on this host; the callback lets it fail the
+/// machine now instead of at its deployment timeout. Best-effort: a callback that
+/// does not land (after its own retries, or a v4 controller's `404`) must NOT loop
+/// or mask the failure — it is logged (non-secret) and the original error is
+/// returned, which parks PID 1 so the controller still times the host out.
+fn report_provision_failure(
+    e: RunError,
+    provision_failed: impl FnOnce(&'static str) -> Result<(), ClientError>,
+) -> RunError {
+    let reason = provision_failure_reason(&e);
+    match provision_failed(reason) {
+        Ok(()) => eprintln!("beskar7-inspector: provision-failed callback accepted ({reason})"),
+        Err(cb) => eprintln!("beskar7-inspector: provision-failed callback did not land: {cb}"),
+    }
+    e
+}
+
 /// Run the destructive deploy steps in order — write the digest-pinned image,
 /// re-read the partition table, locate `COS_OEM`, inject the per-host config — each
 /// gated by the one before (§9.1 step 5). Returns the first failing step's
-/// [`RunError`]; the caller fires the provision-failed callback for it. Kept
-/// separate from [`run`] so the deploy-step error path has a single funnel for the
-/// callback.
+/// [`RunError`]; the caller reports it through [`report_provision_failure`].
 fn run_deploy_steps(
     target: &crate::target_disk::TargetDisk,
     params: &BootParams,
@@ -237,19 +256,32 @@ fn run_deploy_steps(
 }
 
 /// A short, secret-free reason string for the provision-failed callback, derived
-/// from which deploy step failed. The strings name the failing step only — never
-/// the image bytes, the join secret, device paths, or status codes — so they are
-/// safe to put on the wire and in a log (§9). `&'static str` because the controller
-/// uses the reason for operator-facing diagnosis, not machine parsing.
-fn deploy_failure_reason(e: &RunError) -> &'static str {
+/// from which Phase 2 step failed. The strings name the failing step only — never
+/// the image bytes, the join secret, device names or paths, or status codes — so
+/// they are safe to put on the wire and in a log (§9); the console line carries
+/// the detail. `&'static str` because the controller uses the reason for
+/// operator-facing diagnosis, not machine parsing.
+fn provision_failure_reason(e: &RunError) -> &'static str {
     match e {
+        RunError::Disk(d) => disk_error_reason(d),
         RunError::Deploy(d) => deploy_error_reason(d),
         // find_oem_partition failed — the freshly-written image had no locatable
         // COS_OEM partition to inject into.
         RunError::Oem(_) => "COS_OEM partition not found",
-        // run_deploy_steps only surfaces Deploy/Oem errors, but keep the match total
-        // so a future step added there cannot silently fall through without a reason.
+        // Only Disk/Deploy/Oem errors are reported, but keep the match total so a
+        // future step cannot silently fall through without a reason.
         _ => "deploy failed",
+    }
+}
+
+/// Map a [`DiskError`] (target-disk selection, §9.1 step 2) to its callback reason.
+fn disk_error_reason(e: &DiskError) -> &'static str {
+    match e {
+        DiskError::NoEligibleDisk => "no eligible target disk",
+        DiskError::PinNotFound { .. } => "pinned target disk not found",
+        DiskError::PinNotBlockDevice { .. } => "pinned target disk is not a block device",
+        DiskError::PinNotWholeDisk { .. } => "pinned target disk is a partition",
+        DiskError::PinIneligible { .. } => "pinned target disk is ineligible",
     }
 }
 
@@ -586,7 +618,7 @@ mod tests {
 
         // The Oem (find-partition) error path has its own reason.
         assert_eq!(
-            deploy_failure_reason(&RunError::Oem(crate::oem::OemError::NotFound {
+            provision_failure_reason(&RunError::Oem(crate::oem::OemError::NotFound {
                 disk: "nvme0n1".into(),
             })),
             "COS_OEM partition not found"
@@ -596,12 +628,125 @@ mod tests {
         // smoke check — the real guarantee is that the strings are fixed literals.)
         for r in [
             deploy_error_reason(&DeployError::Sync(std::io::Error::other("x"))),
-            deploy_failure_reason(&RunError::Oem(crate::oem::OemError::NotFound {
+            provision_failure_reason(&RunError::Oem(crate::oem::OemError::NotFound {
                 disk: "nvme0n1".into(),
             })),
         ] {
             assert!(r.len() < 64, "reason {r:?} should be short");
             assert!(!r.contains("Bearer"), "reason {r:?} must not name a token");
+        }
+    }
+
+    // --- a missing target disk is reported, not left to time out -------------
+
+    fn some_disk() -> crate::target_disk::TargetDisk {
+        crate::target_disk::TargetDisk {
+            kname: "nvme0n1".into(),
+            size_bytes: 1 << 30,
+            dev_number: "259:0".into(),
+        }
+    }
+
+    #[test]
+    fn a_missing_target_disk_is_reported_then_returned() {
+        // The inspection report was accepted, so the controller is waiting on this
+        // host: without the callback the machine only fails at its deployment
+        // timeout (20 minutes by default).
+        let reported = std::cell::RefCell::new(Vec::new());
+        let out = require_target(Err(DiskError::NoEligibleDisk), |reason| {
+            reported.borrow_mut().push(reason);
+            Ok(())
+        });
+        assert!(matches!(
+            out,
+            Err(RunError::Disk(DiskError::NoEligibleDisk))
+        ));
+        assert_eq!(*reported.borrow(), vec!["no eligible target disk"]);
+    }
+
+    #[test]
+    fn an_unusable_pinned_disk_is_reported_too() {
+        let reported = std::cell::RefCell::new(Vec::new());
+        let out = require_target(
+            Err(DiskError::PinNotWholeDisk {
+                kname: "sda1".into(),
+            }),
+            |reason| {
+                reported.borrow_mut().push(reason);
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            out,
+            Err(RunError::Disk(DiskError::PinNotWholeDisk { .. }))
+        ));
+        assert_eq!(
+            *reported.borrow(),
+            vec!["pinned target disk is a partition"]
+        );
+    }
+
+    #[test]
+    fn a_selected_target_disk_reports_nothing() {
+        let out = require_target(Ok(some_disk()), |reason| {
+            panic!("reported {reason:?} for a usable disk")
+        });
+        assert_eq!(out.expect("the disk").kname, "nvme0n1");
+    }
+
+    #[test]
+    fn a_failed_callback_does_not_mask_the_missing_disk() {
+        // Best-effort, like the deploy-step funnel: a callback that does not land
+        // (a v4 controller's 404, retries exhausted) leaves the original error.
+        let calls = Cell::new(0u32);
+        let out = require_target(Err(DiskError::NoEligibleDisk), |_| {
+            calls.set(calls.get() + 1);
+            Err(ClientError::Http(404))
+        });
+        assert!(matches!(
+            out,
+            Err(RunError::Disk(DiskError::NoEligibleDisk))
+        ));
+        assert_eq!(calls.get(), 1, "reported once, not retried here");
+    }
+
+    #[test]
+    fn disk_reasons_name_the_cause_without_device_names() {
+        use crate::target_disk::Ineligible;
+        let cases = [
+            (DiskError::NoEligibleDisk, "no eligible target disk"),
+            (
+                DiskError::PinNotFound {
+                    pin: "/dev/disk/by-id/wwn-0x5000c500a1b2c3d4".into(),
+                },
+                "pinned target disk not found",
+            ),
+            (
+                DiskError::PinNotBlockDevice {
+                    kname: "ttyS0".into(),
+                },
+                "pinned target disk is not a block device",
+            ),
+            (
+                DiskError::PinNotWholeDisk {
+                    kname: "sda1".into(),
+                },
+                "pinned target disk is a partition",
+            ),
+            (
+                DiskError::PinIneligible {
+                    kname: "sdb".into(),
+                    reason: Ineligible::Removable,
+                },
+                "pinned target disk is ineligible",
+            ),
+        ];
+        for (err, want) in cases {
+            let got = provision_failure_reason(&RunError::Disk(err));
+            assert_eq!(got, want);
+            for name in ["wwn-0x5000c500a1b2c3d4", "ttyS0", "sda1", "sdb", "/dev/"] {
+                assert!(!got.contains(name), "reason {got:?} names a device");
+            }
         }
     }
 
