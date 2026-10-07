@@ -14,6 +14,9 @@
 //! poll GET /bootstrap (404/5xx = not ready)             client::fetch_bootstrap
 //! write the digest-pinned image to the disk             deploy::write_image
 //! re-read the partition table                           deploy::reread_partition_table
+//! locate the ESP on the target disk (UEFI boot only)    esp::find_esp_partition
+//! mount the ESP read-only, check its loader             deploy::verify_esp_loader
+//! add/reuse its Boot####, place it after network ones   efiboot::ensure_disk_boot_entry
 //! locate COS_OEM on the target disk                     oem::find_oem_partition
 //! mount COS_OEM, inject 99_beskar7.yaml + provider-id   deploy::inject_oem_config
 //! zero the user-data buffer                             drop(user_data)
@@ -44,7 +47,9 @@ use zeroize::Zeroizing;
 
 use crate::client::{CallbackClient, ClientError};
 use crate::cmdline::{BootParams, CmdlineError};
-use crate::deploy::{self, DeployError};
+use crate::deploy::{self, DeployError, Part};
+use crate::efiboot::{self, EfiBootError};
+use crate::esp::{self, EspError, EspPartition};
 use crate::image::DEFAULT_MAX_IMAGE_BYTES;
 use crate::net::{self, NetError};
 use crate::oem::{self, OemError};
@@ -92,6 +97,12 @@ pub enum RunError {
     /// controller with a fresh token (§9.2).
     #[error("bootstrap fetch aborted (not retryable): {0}")]
     BootstrapAborted(#[source] ClientError),
+    /// Locating the EFI System Partition on the target disk failed.
+    #[error(transparent)]
+    Esp(#[from] EspError),
+    /// Registering the UEFI boot entry for the disk failed.
+    #[error(transparent)]
+    EfiBoot(#[from] EfiBootError),
     /// Locating the `COS_OEM` partition on the target disk failed.
     #[error(transparent)]
     Oem(#[from] OemError),
@@ -235,9 +246,11 @@ fn report_provision_failure(
 }
 
 /// Run the destructive deploy steps in order — write the digest-pinned image,
-/// re-read the partition table, locate `COS_OEM`, inject the per-host config — each
-/// gated by the one before (§9.1 step 5). Returns the first failing step's
-/// [`RunError`]; the caller reports it through [`report_provision_failure`].
+/// re-read the partition table, register the UEFI boot entry for the ESP, locate
+/// `COS_OEM`, inject the per-host config — each gated by the one before (§9.1
+/// step 5). The ESP step runs first so that its failure leaves no join secret on
+/// the disk. Returns the first failing step's [`RunError`]; the caller reports it
+/// through [`report_provision_failure`].
 fn run_deploy_steps(
     target: &crate::target_disk::TargetDisk,
     params: &BootParams,
@@ -250,9 +263,55 @@ fn run_deploy_steps(
         DEFAULT_MAX_IMAGE_BYTES,
     )?;
     deploy::reread_partition_table(target)?;
+    esp_boot_entry_step(
+        std::path::Path::new(crate::probe::system::EFI_SYSFS_PATH).exists(),
+        || esp::find_esp_partition(target),
+        |esp| {
+            deploy::verify_esp_loader(esp)?;
+            let entry = efiboot::ensure_disk_boot_entry(esp)?;
+            let order: Vec<String> = entry
+                .boot_order
+                .iter()
+                .map(|n| format!("{n:04X}"))
+                .collect();
+            eprintln!(
+                "beskar7-inspector: UEFI boot entry Boot{:04X} {} for {} (BootOrder {})",
+                entry.number,
+                if entry.created { "created" } else { "reused" },
+                esp.dev_path(),
+                order.join(",")
+            );
+            Ok(())
+        },
+    )?;
     let oem_partition = oem::find_oem_partition(target)?;
     deploy::inject_oem_config(&oem_partition, user_data, &params.provider_id)?;
     Ok(())
+}
+
+/// The ESP step of [`run_deploy_steps`], over injected `find` (locate the ESP) and
+/// `register` (check its loader, write the boot entry) so the skip policy is
+/// unit-tested. On a legacy BIOS boot (`efi` false) there is no NVRAM to write, and
+/// an image with no GPT or no ESP ([`EspError::is_absent`]) has nothing to point
+/// an entry at: both log and skip. Every other failure — a GPT read error, an I/O
+/// error on a located ESP, a refused NVRAM write — is returned (hard failure).
+fn esp_boot_entry_step(
+    efi: bool,
+    find: impl FnOnce() -> Result<EspPartition, EspError>,
+    register: impl FnOnce(&EspPartition) -> Result<(), RunError>,
+) -> Result<(), RunError> {
+    if !efi {
+        eprintln!("beskar7-inspector: legacy BIOS boot, skipping the UEFI boot entry");
+        return Ok(());
+    }
+    match find() {
+        Ok(esp) => register(&esp),
+        Err(e) if e.is_absent() => {
+            eprintln!("beskar7-inspector: {e}, skipping the UEFI boot entry");
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// A short, secret-free reason string for the provision-failed callback, derived
@@ -265,10 +324,17 @@ fn provision_failure_reason(e: &RunError) -> &'static str {
     match e {
         RunError::Disk(d) => disk_error_reason(d),
         RunError::Deploy(d) => deploy_error_reason(d),
+        // Opening or identity-checking the whole disk to read its GPT failed.
+        RunError::Esp(EspError::Device(d)) => deploy_error_reason(d),
+        // Reading or parsing the freshly-written GPT failed. (No GPT / no ESP is a
+        // skip, not an error, so it never reaches here.)
+        RunError::Esp(_) => "ESP GPT read failed",
+        // Mounting efivarfs, or reading/writing Boot#### / BootOrder, failed.
+        RunError::EfiBoot(_) => "UEFI boot entry failed",
         // find_oem_partition failed — the freshly-written image had no locatable
         // COS_OEM partition to inject into.
         RunError::Oem(_) => "COS_OEM partition not found",
-        // Only Disk/Deploy/Oem errors are reported, but keep the match total so a
+        // Only Disk/Deploy/Esp/EfiBoot/Oem errors are reported, but keep the match total so a
         // future step cannot silently fall through without a reason.
         _ => "deploy failed",
     }
@@ -287,7 +353,7 @@ fn disk_error_reason(e: &DiskError) -> &'static str {
 
 /// Map a [`DeployError`] to its short, secret-free callback reason (§9). Groups the
 /// step's variants: image fetch/digest, whole-disk write/identity, partition
-/// re-read, and `COS_OEM` mount/inject.
+/// re-read, the ESP loader check, and `COS_OEM` mount/inject.
 fn deploy_error_reason(e: &DeployError) -> &'static str {
     use crate::image::ImageError;
     match e {
@@ -308,12 +374,17 @@ fn deploy_error_reason(e: &DeployError) -> &'static str {
         | DeployError::DeviceIdentityMismatch { .. }
         | DeployError::BadDeviceNumber { .. } => "target disk error",
         DeployError::Reread { .. } => "partition re-read failed",
-        DeployError::Mountpoint { .. }
-        | DeployError::MakeNode { .. }
-        | DeployError::Mount { .. }
-        | DeployError::ConfigWrite(_)
-        | DeployError::ProviderIdWrite(_)
-        | DeployError::Unmount { .. } => "COS_OEM inject failed",
+        DeployError::Mountpoint { part, .. }
+        | DeployError::MakeNode { part, .. }
+        | DeployError::Mount { part, .. }
+        | DeployError::Unmount { part, .. } => match part {
+            Part::Esp => "ESP loader check failed",
+            Part::Oem => "COS_OEM inject failed",
+        },
+        DeployError::EspLoaderMissing { .. } | DeployError::EspLoaderCheck { .. } => {
+            "ESP loader check failed"
+        }
+        DeployError::ConfigWrite(_) | DeployError::ProviderIdWrite(_) => "COS_OEM inject failed",
         // reboot_now's error never flows through run_deploy_steps (it runs after a
         // successful deploy), but keep the match total.
         DeployError::Reboot(_) => "deploy failed",
@@ -616,6 +687,57 @@ mod tests {
             "COS_OEM inject failed"
         );
 
+        // The ESP loader check has its own reason, distinct from COS_OEM.
+        assert_eq!(
+            deploy_error_reason(&DeployError::Mount {
+                part: Part::Esp,
+                dev: "/dev/sda1".into(),
+                source: nix::errno::Errno::EIO,
+            }),
+            "ESP loader check failed"
+        );
+        assert_eq!(
+            deploy_error_reason(&DeployError::Mount {
+                part: Part::Oem,
+                dev: "/dev/sda2".into(),
+                source: nix::errno::Errno::ENODEV,
+            }),
+            "COS_OEM inject failed"
+        );
+        assert_eq!(
+            deploy_error_reason(&DeployError::EspLoaderMissing {
+                path: deploy::ESP_LOADER_PATH,
+            }),
+            "ESP loader check failed"
+        );
+        assert_eq!(
+            deploy_error_reason(&DeployError::EspLoaderCheck {
+                path: deploy::ESP_LOADER_PATH,
+                source: std::io::Error::other("x"),
+            }),
+            "ESP loader check failed"
+        );
+        assert_eq!(
+            provision_failure_reason(&RunError::Esp(EspError::BadGpt { disk: "sda".into() })),
+            "ESP GPT read failed"
+        );
+        assert_eq!(
+            provision_failure_reason(&RunError::EfiBoot(EfiBootError::WriteVar {
+                name: "BootOrder".into(),
+                source: std::io::Error::other("x"),
+            })),
+            "UEFI boot entry failed"
+        );
+        // A whole-disk open/identity failure while reading the GPT is a disk error.
+        assert_eq!(
+            provision_failure_reason(&RunError::Esp(EspError::Device(
+                DeployError::NoDeviceNumber {
+                    path: "/dev/sda".into(),
+                }
+            ))),
+            "target disk error"
+        );
+
         // The Oem (find-partition) error path has its own reason.
         assert_eq!(
             provision_failure_reason(&RunError::Oem(crate::oem::OemError::NotFound {
@@ -635,6 +757,111 @@ mod tests {
             assert!(r.len() < 64, "reason {r:?} should be short");
             assert!(!r.contains("Bearer"), "reason {r:?} must not name a token");
         }
+    }
+
+    // --- the ESP boot-entry step: skip when absent, fail hard otherwise --------
+
+    fn located_esp() -> EspPartition {
+        EspPartition {
+            kname: "sda1".into(),
+            dev_number: "8:1".into(),
+            gpt: crate::esp::GptEsp {
+                number: 1,
+                unique_guid: [7; 16],
+                first_lba: 2048,
+                last_lba: 3071,
+            },
+        }
+    }
+
+    #[test]
+    fn esp_step_skips_on_legacy_boot_without_looking_for_the_esp() {
+        let got = esp_boot_entry_step(
+            false,
+            || panic!("legacy boot must not read the GPT"),
+            |_| panic!("legacy boot must not register an entry"),
+        );
+        assert!(got.is_ok());
+    }
+
+    #[test]
+    fn esp_step_skips_when_the_image_has_no_gpt_or_no_esp() {
+        for absent in [
+            EspError::NoGpt { disk: "sda".into() },
+            EspError::NotFound { disk: "sda".into() },
+        ] {
+            let got = esp_boot_entry_step(
+                true,
+                || Err(absent),
+                |_| panic!("no ESP, nothing to register"),
+            );
+            assert!(got.is_ok(), "an absent ESP is a skip");
+        }
+    }
+
+    #[test]
+    fn esp_step_fails_hard_on_a_gpt_read_error() {
+        let got = esp_boot_entry_step(
+            true,
+            || {
+                Err(EspError::ReadGpt {
+                    disk: "sda".into(),
+                    source: std::io::Error::from_raw_os_error(nix::libc::EIO),
+                })
+            },
+            |_| panic!("unreachable"),
+        );
+        let err = got.unwrap_err();
+        assert_eq!(provision_failure_reason(&err), "ESP GPT read failed");
+    }
+
+    #[test]
+    fn esp_step_fails_hard_on_an_io_error_on_a_located_esp() {
+        // The ESP was found, but mounting it hit an I/O error: a bad disk.
+        let got = esp_boot_entry_step(
+            true,
+            || Ok(located_esp()),
+            |esp| {
+                Err(RunError::Deploy(DeployError::Mount {
+                    part: Part::Esp,
+                    dev: esp.dev_path(),
+                    source: nix::errno::Errno::EIO,
+                }))
+            },
+        );
+        let err = got.unwrap_err();
+        assert_eq!(provision_failure_reason(&err), "ESP loader check failed");
+    }
+
+    #[test]
+    fn esp_step_fails_hard_on_a_refused_nvram_write() {
+        let got = esp_boot_entry_step(
+            true,
+            || Ok(located_esp()),
+            |_| {
+                Err(RunError::EfiBoot(EfiBootError::WriteVar {
+                    name: "Boot0001".into(),
+                    source: std::io::Error::from_raw_os_error(nix::libc::EIO),
+                }))
+            },
+        );
+        let err = got.unwrap_err();
+        assert_eq!(provision_failure_reason(&err), "UEFI boot entry failed");
+    }
+
+    #[test]
+    fn esp_step_registers_a_located_esp() {
+        let mut seen = None;
+        esp_boot_entry_step(
+            true,
+            || Ok(located_esp()),
+            |esp| {
+                seen = Some(esp.kname.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen.as_deref(), Some("sda1"));
     }
 
     // --- a missing target disk is reported, not left to time out -------------

@@ -95,3 +95,12 @@ vmxnet3
 
 # Mandatory: COS_OEM (and the deploy mount) is ext2/3/4
 ext4
+# Mandatory: the ESP, mounted read-only to check its loader, is FAT. The mount
+# names its codepage and charset explicitly (codepage=437,iocharset=ascii), so
+# it needs exactly these NLS tables; vfat pulls in fat.
+vfat
+nls_cp437
+nls_ascii
+# Mandatory: efivarfs, through which the deploy registers the disk's UEFI boot
+# entry (Boot#### and BootOrder). Not built into Alpine's linux-lts.
+efivarfs

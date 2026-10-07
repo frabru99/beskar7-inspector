@@ -76,7 +76,14 @@ parameters on the kernel cmdline. The inspector then runs two phases:
    verified TLS (success is `202 Accepted`). `--dry-run` stops here.
 2. **Provision** (when bootstrap data is ready) — `GET` the CAPI bootstrap
    user-data, stream the digest-pinned whole-disk OS image (a Kairos raw image)
-   onto the selected disk while verifying its SHA-256, inject a per-host
+   onto the selected disk while verifying its SHA-256, register a UEFI boot
+   entry for the image's ESP loader — the removable-media path for the
+   inspector's architecture, `\EFI\BOOT\BOOTX64.EFI` on x86_64 and
+   `\EFI\BOOT\BOOTAA64.EFI` on aarch64 (an image without it fails the deploy) —
+   reusing the firmware's own entry for that partition if there is one, right
+   after the network entries in `BootOrder`,
+   so the first boot finds the disk without an NVRAM entry of its own (skipped
+   on legacy BIOS boots and for images without an ESP), inject a per-host
    cloud-config (carrying the join secret) into the image's `COS_OEM` partition,
    and `reboot(2)` into the provisioned OS.
 
@@ -84,7 +91,8 @@ parameters on the kernel cmdline. The inspector then runs two phases:
 power on → PXE → controller-rendered iPXE → inspector
               Phase 1: probe → POST report (202)
               Phase 2: GET bootstrap → write image (digest-verified)
-                       → inject COS_OEM config → reboot → target OS
+                       → UEFI boot entry for the ESP → inject COS_OEM config
+                       → reboot → target OS
 ```
 
 The wire contract — endpoints, cmdline parameters, the report schema, the
@@ -114,6 +122,8 @@ hardware is absent binds nothing.
 | | Marvell/QLogic FastLinQ, Emulex OneConnect, Marvell/Aquantia AQtion, AMD/Solarflare, Chelsio T4–T6, Cisco UCS VIC | `qede`, `be2net`, `atlantic`, `sfc`, `cxgb4`, `enic` |
 | | Virtual: virtio, VMware vmxnet3 | `virtio_net`, `vmxnet3` |
 | Filesystem | ext4 (for the image's `COS_OEM` partition) | `ext4` |
+| | FAT (for the image's ESP, mounted read-only to check its loader) | `vfat`, `nls_cp437`, `nls_ascii` |
+| | efivarfs (for the disk's UEFI boot entry) | `efivarfs` |
 
 Drivers that need device firmware get it from the image. At build time, every
 firmware file the shipped modules declare is copied into `/lib/firmware`, where
@@ -199,8 +209,10 @@ src/report.rs       serde structs that serialize to the contract report schema
 src/client.rs       rustls callback client: POST report (202), GET bootstrap
 src/image.rs        digest-pinned streaming target-image fetch
 src/target_disk.rs  target-disk selection
+src/esp.rs          locate the EFI System Partition (GPT type GUID) on the target disk
+src/efiboot.rs      register the disk's UEFI boot entry over efivarfs (native efibootmgr)
 src/oem.rs          locate the COS_OEM partition on the target disk
-src/deploy.rs       whole-disk write + COS_OEM mount/inject + reboot
+src/deploy.rs       whole-disk write + ESP loader check + COS_OEM mount/inject + reboot
 src/run.rs          the PID-1 two-phase pipeline
 src/main.rs         thin PID-1 entrypoint over run::run
 tests/contract.rs   golden-fixture report round-trip (shared with beskar7)
