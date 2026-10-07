@@ -152,7 +152,7 @@ fn find_oem_in(
 /// partition node with one; `queue`/`slaves`/`device`/… do not). This structural
 /// enumeration is what keeps the `COS_OEM` search confined to the target disk
 /// (finding H1) — there is no system-wide scan to go wrong.
-fn target_partitions(block_dir: &Path, disk: &str) -> Vec<String> {
+pub(crate) fn target_partitions(block_dir: &Path, disk: &str) -> Vec<String> {
     let disk_dir = block_dir.join(disk);
     let Ok(entries) = fs::read_dir(&disk_dir) else {
         return Vec::new();

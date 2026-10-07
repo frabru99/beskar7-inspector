@@ -14,6 +14,8 @@
 //! poll GET /bootstrap (404/5xx = not ready)             client::fetch_bootstrap
 //! write the digest-pinned image to the disk             deploy::write_image
 //! re-read the partition table                           deploy::reread_partition_table
+//! locate the ESP on the target disk                     esp::find_esp_partition
+//! mount the ESP, write startup.nsh                      deploy::inject_startup_nsh
 //! locate COS_OEM on the target disk                     oem::find_oem_partition
 //! mount COS_OEM, inject 99_beskar7.yaml + provider-id   deploy::inject_oem_config
 //! zero the user-data buffer                             drop(user_data)
@@ -44,7 +46,8 @@ use zeroize::Zeroizing;
 
 use crate::client::{CallbackClient, ClientError};
 use crate::cmdline::{BootParams, CmdlineError};
-use crate::deploy::{self, DeployError};
+use crate::deploy::{self, DeployError, Part};
+use crate::esp::{self, EspError};
 use crate::image::DEFAULT_MAX_IMAGE_BYTES;
 use crate::net::{self, NetError};
 use crate::oem::{self, OemError};
@@ -92,6 +95,9 @@ pub enum RunError {
     /// controller with a fresh token (§9.2).
     #[error("bootstrap fetch aborted (not retryable): {0}")]
     BootstrapAborted(#[source] ClientError),
+    /// Locating the EFI System Partition on the target disk failed.
+    #[error(transparent)]
+    Esp(#[from] EspError),
     /// Locating the `COS_OEM` partition on the target disk failed.
     #[error(transparent)]
     Oem(#[from] OemError),
@@ -235,8 +241,9 @@ fn report_provision_failure(
 }
 
 /// Run the destructive deploy steps in order — write the digest-pinned image,
-/// re-read the partition table, locate `COS_OEM`, inject the per-host config — each
-/// gated by the one before (§9.1 step 5). Returns the first failing step's
+/// re-read the partition table, write `startup.nsh` to the ESP, locate `COS_OEM`,
+/// inject the per-host config — each gated by the one before (§9.1 step 5). The
+/// ESP step runs first so that its failure leaves no join secret on the disk. Returns the first failing step's
 /// [`RunError`]; the caller reports it through [`report_provision_failure`].
 fn run_deploy_steps(
     target: &crate::target_disk::TargetDisk,
@@ -250,6 +257,8 @@ fn run_deploy_steps(
         DEFAULT_MAX_IMAGE_BYTES,
     )?;
     deploy::reread_partition_table(target)?;
+    let esp_partition = esp::find_esp_partition(target)?;
+    deploy::inject_startup_nsh(&esp_partition)?;
     let oem_partition = oem::find_oem_partition(target)?;
     deploy::inject_oem_config(&oem_partition, user_data, &params.provider_id)?;
     Ok(())
@@ -265,10 +274,14 @@ fn provision_failure_reason(e: &RunError) -> &'static str {
     match e {
         RunError::Disk(d) => disk_error_reason(d),
         RunError::Deploy(d) => deploy_error_reason(d),
+        // Opening or identity-checking the whole disk to read its GPT failed.
+        RunError::Esp(EspError::Device(d)) => deploy_error_reason(d),
+        // The freshly-written image had no GPT or no ESP to write startup.nsh to.
+        RunError::Esp(_) => "ESP not found",
         // find_oem_partition failed — the freshly-written image had no locatable
         // COS_OEM partition to inject into.
         RunError::Oem(_) => "COS_OEM partition not found",
-        // Only Disk/Deploy/Oem errors are reported, but keep the match total so a
+        // Only Disk/Deploy/Esp/Oem errors are reported, but keep the match total so a
         // future step cannot silently fall through without a reason.
         _ => "deploy failed",
     }
@@ -287,7 +300,7 @@ fn disk_error_reason(e: &DiskError) -> &'static str {
 
 /// Map a [`DeployError`] to its short, secret-free callback reason (§9). Groups the
 /// step's variants: image fetch/digest, whole-disk write/identity, partition
-/// re-read, and `COS_OEM` mount/inject.
+/// re-read, ESP `startup.nsh` mount/write, and `COS_OEM` mount/inject.
 fn deploy_error_reason(e: &DeployError) -> &'static str {
     use crate::image::ImageError;
     match e {
@@ -308,12 +321,15 @@ fn deploy_error_reason(e: &DeployError) -> &'static str {
         | DeployError::DeviceIdentityMismatch { .. }
         | DeployError::BadDeviceNumber { .. } => "target disk error",
         DeployError::Reread { .. } => "partition re-read failed",
-        DeployError::Mountpoint { .. }
-        | DeployError::MakeNode { .. }
-        | DeployError::Mount { .. }
-        | DeployError::ConfigWrite(_)
-        | DeployError::ProviderIdWrite(_)
-        | DeployError::Unmount { .. } => "COS_OEM inject failed",
+        DeployError::Mountpoint { part, .. }
+        | DeployError::MakeNode { part, .. }
+        | DeployError::Mount { part, .. }
+        | DeployError::Unmount { part, .. } => match part {
+            Part::Esp => "ESP startup.nsh write failed",
+            Part::Oem => "COS_OEM inject failed",
+        },
+        DeployError::StartupNshWrite(_) => "ESP startup.nsh write failed",
+        DeployError::ConfigWrite(_) | DeployError::ProviderIdWrite(_) => "COS_OEM inject failed",
         // reboot_now's error never flows through run_deploy_steps (it runs after a
         // successful deploy), but keep the match total.
         DeployError::Reboot(_) => "deploy failed",
@@ -614,6 +630,41 @@ mod tests {
         assert_eq!(
             deploy_error_reason(&DeployError::ConfigWrite(std::io::Error::other("x"))),
             "COS_OEM inject failed"
+        );
+
+        // The ESP mount/write steps have their own reason, distinct from COS_OEM.
+        assert_eq!(
+            deploy_error_reason(&DeployError::Mount {
+                part: Part::Esp,
+                dev: "/dev/sda1".into(),
+                source: nix::errno::Errno::ENODEV,
+            }),
+            "ESP startup.nsh write failed"
+        );
+        assert_eq!(
+            deploy_error_reason(&DeployError::Mount {
+                part: Part::Oem,
+                dev: "/dev/sda2".into(),
+                source: nix::errno::Errno::ENODEV,
+            }),
+            "COS_OEM inject failed"
+        );
+        assert_eq!(
+            deploy_error_reason(&DeployError::StartupNshWrite(std::io::Error::other("x"))),
+            "ESP startup.nsh write failed"
+        );
+        assert_eq!(
+            provision_failure_reason(&RunError::Esp(EspError::NotFound { disk: "sda".into() })),
+            "ESP not found"
+        );
+        // A whole-disk open/identity failure while reading the GPT is a disk error.
+        assert_eq!(
+            provision_failure_reason(&RunError::Esp(EspError::Device(
+                DeployError::NoDeviceNumber {
+                    path: "/dev/sda".into(),
+                }
+            ))),
+            "target disk error"
         );
 
         // The Oem (find-partition) error path has its own reason.

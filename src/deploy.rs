@@ -1,20 +1,27 @@
 //! Phase 2 deploy — write the digest-verified target image, inject the per-host
 //! config, and reboot into the provisioned OS (contract §9.1 step 5).
 //!
-//! This is the **destructive** half of provisioning. It runs in four live steps,
+//! This is the **destructive** half of provisioning. It runs in five live steps,
 //! each gated by the one before:
 //!   1. [`write_image`] (§9.1 5.1–5.2) — stream the whole-disk OS image
 //!      (`beskar7.target`) straight onto the block device chosen by
 //!      [`crate::target_disk`], verifying it against `beskar7.target-digest`.
 //!   2. [`reread_partition_table`] (§9.1 5.3) — `BLKRRPART` so the freshly-written
-//!      image's partitions appear; the caller then locates `COS_OEM`
-//!      ([`crate::oem`]).
-//!   3. [`inject_oem_config`] (§9.1 5.3–5.4) — mount the `COS_OEM` partition
+//!      image's partitions appear; the caller then locates the ESP
+//!      ([`crate::esp`]) and `COS_OEM` ([`crate::oem`]).
+//!   3. [`inject_startup_nsh`] — mount the ESP (`vfat`, `nodev,nosuid,noexec`),
+//!      write the EFI Shell `startup.nsh` that chain-loads the disk's loader on
+//!      the first boot (no NVRAM entry exists for the new disk yet), `fsync`, and
+//!      unmount. Runs before step 4 so a failure here leaves no join secret on disk.
+//!   4. [`inject_oem_config`] (§9.1 5.3–5.4) — mount the `COS_OEM` partition
 //!      (`nodev,nosuid,noexec`), write the per-host Kairos cloud-config
 //!      (`99_beskar7.yaml`, carrying the CAPI join secret) and the P2 provider-id
 //!      artifact (`beskar7/provider-id`, `b7://<ns>/<host>` verbatim) — both
 //!      `0600`/root — `fsync` files + directories, and unmount.
-//!   4. [`reboot_now`] (§9.1 5.4) — `reboot(2)` into the provisioned OS.
+//!   5. [`reboot_now`] (§9.1 5.4) — `reboot(2)` into the provisioned OS.
+//!
+//! The image digest covers only the bytes streamed in step 1; the ESP and
+//! `COS_OEM` writes happen after verification and do not affect it.
 //!
 //! ## Identity, never a re-resolvable path (TOCTOU guard, §5 / §9.1 5.3)
 //! Neither destructive operation trusts a `/dev/<kname>` path it could re-resolve
@@ -24,11 +31,12 @@
 //!     block device — the check and the write share one fd, so nothing can repoint
 //!     the device between them. `O_EXCL` also fails `EBUSY` on a mounted-but-not-
 //!     system disk rather than clobbering it.
-//!   * The **`COS_OEM` mount** does not mount a `/dev` path at all: it `mknod`s a
-//!     private block node from the partition's enumerated `major:minor`
-//!     ([`crate::oem::OemPartition::dev_number`]) and mounts that, so the mount is
-//!     bound to the exact kernel device [`crate::oem`] enumerated on the target
-//!     disk — immune to a `/dev` node being repointed between enumeration and mount.
+//!   * The **`COS_OEM` and ESP mounts** do not mount a `/dev` path at all: each
+//!     `mknod`s a private block node from the partition's enumerated `major:minor`
+//!     ([`crate::oem::OemPartition::dev_number`], [`crate::esp::EspPartition::dev_number`])
+//!     and mounts that, so the mount is bound to the exact kernel device enumerated
+//!     on the target disk — immune to a `/dev` node being repointed between
+//!     enumeration and mount.
 //!
 //! ## Bounded, RAM-free, digest-gated write (§8.1)
 //! The image is streamed by [`crate::image::ImageFetcher::fetch_to`], hashing
@@ -38,7 +46,8 @@
 //! mount/inject/reboot; the unbootable disk is recovered on the next attempt.
 //!
 //! ## Mount lifetime & failure cleanup (§9.1 5.4–5.5, finding H2)
-//! [`inject_oem_config`] **always unmounts `COS_OEM` before returning**, on
+//! [`inject_startup_nsh`] and [`inject_oem_config`] share one mount lifecycle
+//! (`with_private_mount`). [`inject_oem_config`] **always unmounts `COS_OEM` before returning**, on
 //! success or failure (falling back to a lazy `MNT_DETACH` if the eager unmount is
 //! busy) — so the partition is never left mounted across a reboot or a drop to a
 //! debug shell. On an inject failure it first removes the partial `99_beskar7.yaml`
@@ -56,6 +65,7 @@
 //! device paths / `major:minor` / public digests, all non-secret). The caller
 //! zeroes its `user_data` buffer after [`inject_oem_config`] returns.
 
+use std::fmt;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
@@ -67,6 +77,7 @@ use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sys::reboot::{reboot, RebootMode};
 use nix::sys::stat::{makedev, mknod, Mode, SFlag};
 
+use crate::esp::EspPartition;
 use crate::image::{ImageError, ImageFetcher, Sha256Digest};
 use crate::oem::OemPartition;
 use crate::target_disk::TargetDisk;
@@ -90,6 +101,76 @@ const OEM_MOUNTPOINT: &str = "/run/beskar7-oem";
 /// partition's `major:minor` and mounts — so the mount binds to the verified
 /// device number, never a `/dev` path that could be repointed (§9.1 5.3).
 const OEM_DEV_NODE: &str = "/run/beskar7-oem.dev";
+
+/// The EFI Shell script [`inject_startup_nsh`] writes to the ESP root. On the first
+/// boot after the write the firmware has no NVRAM entry for the disk and may drop
+/// into the EFI Shell, which runs `startup.nsh` after its countdown. The script
+/// scans the shell mappings `FS0:`–`FSF:` (the ESP is not necessarily `FS0:`) for
+/// the Ubuntu-based Kairos ESP and starts its fallback loader; the OS then creates
+/// its permanent boot entry. CRLF line endings, as the EFI Shell expects.
+const STARTUP_NSH: &str = concat!(
+    "@echo -off\r\n",
+    "for %i in 0 1 2 3 4 5 6 7 8 9 A B C D E F\r\n",
+    "  if exist FS%i:\\EFI\\ubuntu\\grub.cfg then\r\n",
+    "    if exist FS%i:\\EFI\\BOOT\\BOOTX64.EFI then\r\n",
+    "      FS%i:\r\n",
+    "      \\EFI\\BOOT\\BOOTX64.EFI\r\n",
+    "    endif\r\n",
+    "  endif\r\n",
+    "endfor\r\n",
+);
+/// The script's filename in the ESP root, where the EFI Shell looks for it. FAT is
+/// case-insensitive, so this replaces a `STARTUP.NSH` already in the image.
+const STARTUP_NSH_FILENAME: &str = "startup.nsh";
+
+/// The partition a deploy-time mount writes to. Names it in errors, and lets the
+/// provision-failed reason tell the two inject steps apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// The Kairos `COS_OEM` partition (per-host config + provider-id).
+    Oem,
+    /// The EFI System Partition (`startup.nsh`).
+    Esp,
+}
+
+impl fmt::Display for Part {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Part::Oem => "COS_OEM",
+            Part::Esp => "ESP",
+        })
+    }
+}
+
+/// How [`with_private_mount`] mounts one partition: a private device node and
+/// mountpoint under `/run`, the filesystem type, and its mount options.
+struct PrivateMount {
+    part: Part,
+    node: &'static str,
+    mountpoint: &'static str,
+    fstype: &'static str,
+    data: Option<&'static str>,
+}
+
+/// `COS_OEM` is ext2/3/4, which the ext4 driver mounts.
+const OEM_MOUNT: PrivateMount = PrivateMount {
+    part: Part::Oem,
+    node: OEM_DEV_NODE,
+    mountpoint: OEM_MOUNTPOINT,
+    fstype: "ext4",
+    data: None,
+};
+
+/// The ESP is FAT. The codepage and charset are explicit so the mount needs only
+/// the `nls_cp437` and `nls_ascii` modules the initramfs ships, whatever the
+/// kernel's `CONFIG_FAT_DEFAULT_*` defaults are (Alpine's iocharset is `utf8`).
+const ESP_MOUNT: PrivateMount = PrivateMount {
+    part: Part::Esp,
+    node: "/run/beskar7-esp.dev",
+    mountpoint: "/run/beskar7-esp",
+    fstype: "vfat",
+    data: Some("codepage=437,iocharset=ascii"),
+};
 
 // BLKRRPART = _IO(0x12, 95): re-read a block device's partition table.
 nix::ioctl_none!(blkrrpart, 0x12, 95);
@@ -161,9 +242,11 @@ pub enum DeployError {
         #[source]
         source: Errno,
     },
-    /// The `COS_OEM` mountpoint could not be created.
-    #[error("creating the COS_OEM mountpoint {path}")]
+    /// A partition mountpoint could not be created.
+    #[error("creating the {part} mountpoint {path}")]
     Mountpoint {
+        /// The partition being mounted.
+        part: Part,
         /// The mountpoint path.
         path: String,
         /// The underlying error.
@@ -177,18 +260,22 @@ pub enum DeployError {
         /// The partition `/dev/<kname>` path.
         dev: String,
     },
-    /// Creating the private `COS_OEM` block-device node (`mknod`) failed.
-    #[error("creating the COS_OEM device node for {dev}")]
+    /// Creating a private partition block-device node (`mknod`) failed.
+    #[error("creating the {part} device node for {dev}")]
     MakeNode {
+        /// The partition being mounted.
+        part: Part,
         /// The partition `/dev/<kname>` path the node represents.
         dev: String,
         /// The mknod errno.
         #[source]
         source: Errno,
     },
-    /// Mounting the `COS_OEM` partition failed.
-    #[error("mounting COS_OEM device {dev}")]
+    /// Mounting a partition failed.
+    #[error("mounting {part} device {dev}")]
     Mount {
+        /// The partition being mounted.
+        part: Part,
         /// The partition `/dev/<kname>` path.
         dev: String,
         /// The mount errno.
@@ -204,9 +291,14 @@ pub enum DeployError {
     /// I/O error for symmetry with [`ConfigWrite`](Self::ConfigWrite).
     #[error("writing the COS_OEM provider-id artifact")]
     ProviderIdWrite(#[source] std::io::Error),
-    /// Unmounting `COS_OEM` failed.
-    #[error("unmounting COS_OEM at {path}")]
+    /// Writing or flushing `startup.nsh` on the ESP failed.
+    #[error("writing startup.nsh to the ESP")]
+    StartupNshWrite(#[source] std::io::Error),
+    /// Unmounting a partition failed.
+    #[error("unmounting {part} at {path}")]
     Unmount {
+        /// The partition being unmounted.
+        part: Part,
         /// The mountpoint path.
         path: String,
         /// The umount errno.
@@ -276,7 +368,11 @@ fn effective_max_bytes(build_max: u64, disk_capacity: u64) -> u64 {
 /// at selection/enumeration). Refuses on any mismatch or when no device number was
 /// recorded (§5 / §9.1 5.3 TOCTOU guard). Shared by the whole-disk write and the
 /// `COS_OEM` partition mount.
-fn verify_node_identity(file: &File, path: &str, expected_dev: &str) -> Result<(), DeployError> {
+pub(crate) fn verify_node_identity(
+    file: &File,
+    path: &str,
+    expected_dev: &str,
+) -> Result<(), DeployError> {
     if expected_dev.is_empty() {
         return Err(DeployError::NoDeviceNumber {
             path: path.to_string(),
@@ -339,6 +435,21 @@ pub fn reread_partition_table(target: &TargetDisk) -> Result<(), DeployError> {
     Ok(())
 }
 
+/// Mount the located ESP, write [`STARTUP_NSH`] to its root, and unmount. The
+/// first boot after the write has no NVRAM boot entry for the disk; the EFI Shell
+/// runs this script to chain-load the disk's loader, and the provisioned OS then
+/// creates its permanent entry.
+///
+/// The mount is bound to the ESP's enumerated `major:minor` exactly as for
+/// `COS_OEM` (see [`inject_oem_config`]), and the ESP is **always unmounted before
+/// returning**. The script is non-secret; a partial one left by a failure is
+/// harmless, since the deploy aborts and the next attempt rewrites the disk.
+pub fn inject_startup_nsh(esp: &EspPartition) -> Result<(), DeployError> {
+    with_private_mount(&ESP_MOUNT, &esp.dev_path(), &esp.dev_number, |mnt| {
+        write_and_sync_startup_nsh(mnt)
+    })
+}
+
 /// Mount the located `COS_OEM` partition, write the per-host Kairos cloud-config
 /// (`99_beskar7.yaml`, carrying `user_data` — the CAPI join secret) and the P2
 /// provider-id artifact (`beskar7/provider-id`, `provider_id` verbatim) into it,
@@ -361,9 +472,37 @@ pub fn inject_oem_config(
     user_data: &[u8],
     provider_id: &str,
 ) -> Result<(), DeployError> {
-    let dev = oem.dev_path();
-    let devnum = parse_dev_number(&oem.dev_number)
-        .ok_or_else(|| DeployError::BadDeviceNumber { dev: dev.clone() })?;
+    with_private_mount(&OEM_MOUNT, &oem.dev_path(), &oem.dev_number, |mnt| {
+        // Write both artifacts in this one mount session: 99_beskar7.yaml (the join
+        // secret) then beskar7/provider-id (v4.2, §9.1 5.4). On failure, remove both
+        // partials — the config may hold the join secret — BEFORE unmounting (finding
+        // H2 / §9.1 step 8); with_private_mount unmounts only after this returns.
+        // remove_file on a never-created path is a harmless no-op.
+        let inject = write_and_sync_config(mnt, user_data)
+            .and_then(|()| write_and_sync_provider_id(mnt, provider_id));
+        if inject.is_err() {
+            let _ = fs::remove_file(mnt.join(OEM_CONFIG_FILENAME));
+            let _ = fs::remove_file(
+                mnt.join(OEM_PROVIDER_ID_SUBDIR)
+                    .join(OEM_PROVIDER_ID_FILENAME),
+            );
+        }
+        inject
+    })
+}
+
+/// Mount the partition `dev` (enumerated as `dev_number`) per `spec`, run `write`
+/// against the mount root, and unmount. Shared by [`inject_startup_nsh`] and
+/// [`inject_oem_config`]; always removes the private device node afterward.
+fn with_private_mount(
+    spec: &PrivateMount,
+    dev: &str,
+    dev_number: &str,
+    write: impl FnOnce(&Path) -> Result<(), DeployError>,
+) -> Result<(), DeployError> {
+    let devnum = parse_dev_number(dev_number).ok_or_else(|| DeployError::BadDeviceNumber {
+        dev: dev.to_string(),
+    })?;
 
     // Bind to the kernel partition by its verified major:minor: create a private
     // block node from the enumerated devnum and mount THAT — no /dev path to
@@ -372,7 +511,7 @@ pub fn inject_oem_config(
     // NOT follow a symlink at the final component (it fails EEXIST), so a planted
     // symlink at this path cannot redirect the node — do not "harden" this into an
     // O_NOFOLLOW open, which has different semantics that don't apply to mknod.
-    let node = Path::new(OEM_DEV_NODE);
+    let node = Path::new(spec.node);
     let _ = fs::remove_file(node);
     mknod(
         node,
@@ -381,58 +520,48 @@ pub fn inject_oem_config(
         devnum,
     )
     .map_err(|source| DeployError::MakeNode {
-        dev: dev.clone(),
+        part: spec.part,
+        dev: dev.to_string(),
         source,
     })?;
 
-    let result = mount_inject_unmount(node, user_data, provider_id, &dev);
+    let result = mount_write_unmount(spec, node, dev, write);
     let _ = fs::remove_file(node); // remove the private node after the mount lifetime
     result
 }
 
-/// The mount → write → unmount core, factored out so [`inject_oem_config`] always
+/// The mount → write → unmount core, factored out so [`with_private_mount`] always
 /// removes the private device node afterward. Mounts `node` (`nodev,nosuid,noexec`),
-/// writes both `COS_OEM` artifacts, and **always unmounts before returning** (finding
-/// H2).
-fn mount_inject_unmount(
+/// runs `write`, and **always unmounts before returning** (finding H2).
+fn mount_write_unmount(
+    spec: &PrivateMount,
     node: &Path,
-    user_data: &[u8],
-    provider_id: &str,
     dev: &str,
+    write: impl FnOnce(&Path) -> Result<(), DeployError>,
 ) -> Result<(), DeployError> {
-    let mnt = Path::new(OEM_MOUNTPOINT);
+    let mnt = Path::new(spec.mountpoint);
     fs::create_dir_all(mnt).map_err(|source| DeployError::Mountpoint {
-        path: OEM_MOUNTPOINT.to_string(),
+        part: spec.part,
+        path: spec.mountpoint.to_string(),
         source,
     })?;
 
-    // nodev,nosuid,noexec: COS_OEM holds config, never device nodes, setuid
-    // binaries, or executables (§9.1 5.3). The ext4 driver mounts ext2/3/4.
+    // nodev,nosuid,noexec: COS_OEM and the ESP are only written with config and
+    // scripts here, never device nodes, setuid binaries, or executables (§9.1 5.3).
     let flags = MsFlags::MS_NODEV | MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC;
-    if let Err(source) = mount(Some(node), mnt, Some("ext4"), flags, None::<&str>) {
+    if let Err(source) = mount(Some(node), mnt, Some(spec.fstype), flags, spec.data) {
         let _ = fs::remove_dir(mnt);
         return Err(DeployError::Mount {
+            part: spec.part,
             dev: dev.to_string(),
             source,
         });
     }
 
-    // Write both artifacts in this one mount session: 99_beskar7.yaml (the join
-    // secret) then beskar7/provider-id (v4.2, §9.1 5.4). On failure, remove both
-    // partials — the config may hold the join secret — BEFORE unmounting (finding
-    // H2 / §9.1 step 8). remove_file on a never-created path is a harmless no-op.
-    let inject = write_and_sync_config(mnt, user_data)
-        .and_then(|()| write_and_sync_provider_id(mnt, provider_id));
-    if inject.is_err() {
-        let _ = fs::remove_file(mnt.join(OEM_CONFIG_FILENAME));
-        let _ = fs::remove_file(
-            mnt.join(OEM_PROVIDER_ID_SUBDIR)
-                .join(OEM_PROVIDER_ID_FILENAME),
-        );
-    }
+    let written = write(mnt);
 
-    // Always unmount before returning — COS_OEM is never left mounted across a
-    // reboot or a drop to a debug shell (§9.1 5.4, finding H2). If the eager
+    // Always unmount before returning — the partition is never left mounted across
+    // a reboot or a drop to a debug shell (§9.1 5.4, finding H2). If the eager
     // unmount fails (e.g. EBUSY), fall back to a lazy MNT_DETACH so the mount is
     // still torn down before we return — the "detached before return" invariant is
     // unconditional. The original (eager) error is still surfaced to the caller.
@@ -441,15 +570,16 @@ fn mount_inject_unmount(
         Err(eager) => {
             let _ = umount2(mnt, MntFlags::MNT_DETACH);
             Err(DeployError::Unmount {
-                path: OEM_MOUNTPOINT.to_string(),
+                part: spec.part,
+                path: spec.mountpoint.to_string(),
                 source: eager,
             })
         }
     };
     let _ = fs::remove_dir(mnt); // best-effort tidy of the (now-empty) mountpoint
 
-    // Surface the inject failure first (more informative), then any unmount failure.
-    inject?;
+    // Surface the write failure first (more informative), then any unmount failure.
+    written?;
     unmount?;
     Ok(())
 }
@@ -527,6 +657,26 @@ fn write_and_sync_provider_id(mount_dir: &Path, provider_id: &str) -> Result<(),
     dirf.sync_all().map_err(DeployError::ProviderIdWrite)?;
     let rootf = File::open(mount_dir).map_err(DeployError::ProviderIdWrite)?;
     rootf.sync_all().map_err(DeployError::ProviderIdWrite)?;
+    Ok(())
+}
+
+/// Write [`STARTUP_NSH`] to `<mount_dir>/startup.nsh`, replacing any existing one,
+/// and `fsync` the file and its directory so the script is durable before the
+/// unmount/reboot. Pure file I/O over an injected directory, so it is unit-tested
+/// against a scratch dir without a real mount.
+fn write_and_sync_startup_nsh(mount_dir: &Path) -> Result<(), DeployError> {
+    let path = mount_dir.join(STARTUP_NSH_FILENAME);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .map_err(DeployError::StartupNshWrite)?;
+    file.write_all(STARTUP_NSH.as_bytes())
+        .map_err(DeployError::StartupNshWrite)?;
+    file.sync_all().map_err(DeployError::StartupNshWrite)?;
+    let dir = File::open(mount_dir).map_err(DeployError::StartupNshWrite)?;
+    dir.sync_all().map_err(DeployError::StartupNshWrite)?;
     Ok(())
 }
 
@@ -734,6 +884,56 @@ mod tests {
             .join(OEM_PROVIDER_ID_SUBDIR)
             .join(OEM_PROVIDER_ID_FILENAME);
         assert_eq!(std::fs::read(&path).unwrap(), b"b7://n/h");
+    }
+
+    #[test]
+    fn startup_nsh_is_the_crlf_fs_scan_script() {
+        // The EFI Shell expects CRLF line endings: every LF is preceded by a CR.
+        assert!(STARTUP_NSH.ends_with("\r\n"));
+        assert_eq!(
+            STARTUP_NSH.matches('\n').count(),
+            STARTUP_NSH.matches("\r\n").count(),
+            "no bare LF line endings"
+        );
+        let lines: Vec<&str> = STARTUP_NSH.split("\r\n").collect();
+        assert_eq!(
+            lines,
+            [
+                "@echo -off",
+                "for %i in 0 1 2 3 4 5 6 7 8 9 A B C D E F",
+                "  if exist FS%i:\\EFI\\ubuntu\\grub.cfg then",
+                "    if exist FS%i:\\EFI\\BOOT\\BOOTX64.EFI then",
+                "      FS%i:",
+                "      \\EFI\\BOOT\\BOOTX64.EFI",
+                "    endif",
+                "  endif",
+                "endfor",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn write_and_sync_startup_nsh_replaces_an_existing_script() {
+        let s = crate::probe::testutil::Scratch::new("esp-nsh");
+        let path = s.path().join(STARTUP_NSH_FILENAME);
+        std::fs::write(
+            &path,
+            "a much longer previous startup script body\r\n".repeat(20),
+        )
+        .unwrap();
+        write_and_sync_startup_nsh(s.path()).expect("startup.nsh written");
+        assert_eq!(std::fs::read(&path).unwrap(), STARTUP_NSH.as_bytes());
+    }
+
+    #[test]
+    fn esp_mount_is_vfat_with_explicit_nls_tables() {
+        // The initramfs ships nls_cp437 + nls_ascii (modules.list); the mount must
+        // name exactly those rather than rely on the kernel's FAT defaults.
+        assert_eq!(ESP_MOUNT.fstype, "vfat");
+        assert_eq!(ESP_MOUNT.data, Some("codepage=437,iocharset=ascii"));
+        assert_ne!(ESP_MOUNT.node, OEM_MOUNT.node);
+        assert_ne!(ESP_MOUNT.mountpoint, OEM_MOUNT.mountpoint);
     }
 
     #[test]
