@@ -9,9 +9,10 @@
 //!   2. [`reread_partition_table`] (§9.1 5.3) — `BLKRRPART` so the freshly-written
 //!      image's partitions appear; the caller then locates the ESP
 //!      ([`crate::esp`]) and `COS_OEM` ([`crate::oem`]).
-//!   3. [`verify_esp_loader`] — mount the ESP **read-only** (`vfat`,
-//!      `ro,nodev,nosuid,noexec`), check its [`ESP_LOADER_PATH`] loader exists, and
-//!      unmount. The caller then registers the UEFI boot entry pointing at it
+//!   3. [`prepare_esp`] — mount the ESP (`vfat`, `nodev,nosuid,noexec`), check its
+//!      [`ESP_LOADER_PATH`] loader exists, write the per-deploy marker and — unless
+//!      the image ships one — the `startup.nsh` fallback, `fsync`, and unmount. The
+//!      caller then registers the UEFI boot entry pointing at the loader
 //!      ([`crate::efiboot`]). Runs before step 4 so a failure here leaves no join
 //!      secret on disk.
 //!   4. [`inject_oem_config`] (§9.1 5.3–5.4) — mount the `COS_OEM` partition
@@ -21,9 +22,18 @@
 //!      `0600`/root — `fsync` files + directories, and unmount.
 //!   5. [`reboot_now`] (§9.1 5.4) — `reboot(2)` into the provisioned OS.
 //!
-//! The image digest covers only the bytes streamed in step 1; the `COS_OEM`
-//! writes happen after verification and do not affect it. The ESP is never
-//! written.
+//! The image digest covers only the bytes streamed in step 1; the ESP and
+//! `COS_OEM` writes happen after verification and do not affect it.
+//!
+//! ## The `startup.nsh` fallback
+//! Some firmware (AMI Aptio) rebuilds `BootOrder` from its own setup priorities at
+//! every POST, dropping the entry the inspector writes, and with the built-in EFI
+//! Shell first it ends every boot in the Shell, which runs the first `startup.nsh`
+//! it finds on a mapped filesystem. [`prepare_esp`] writes a random per-deploy
+//! marker `\EFI\beskar7\<marker>.id` and, when the image has no `startup.nsh` of
+//! its own, one at the ESP root: it looks for the marker on `FS0:`–`FS31:` and
+//! starts [`ESP_LOADER_PATH`] there, or says so and stops at the Shell prompt. An
+//! image's own `startup.nsh` is left in place.
 //!
 //! ## Identity, never a re-resolvable path (TOCTOU guard, §5 / §9.1 5.3)
 //! Neither destructive operation trusts a `/dev/<kname>` path it could re-resolve
@@ -48,7 +58,7 @@
 //! mount/inject/reboot; the unbootable disk is recovered on the next attempt.
 //!
 //! ## Mount lifetime & failure cleanup (§9.1 5.4–5.5, finding H2)
-//! [`verify_esp_loader`] and [`inject_oem_config`] share one mount lifecycle
+//! [`prepare_esp`] and [`inject_oem_config`] share one mount lifecycle
 //! (`with_private_mount`). [`inject_oem_config`] **always unmounts `COS_OEM` before returning**, on
 //! success or failure (falling back to a lazy `MNT_DETACH` if the eager unmount is
 //! busy) — so the partition is never left mounted across a reboot or a drop to a
@@ -115,7 +125,7 @@ const REMOVABLE_LOADERS: [(&str, &str); 2] = [
 /// The loader the UEFI boot entry for the disk starts: the removable-media
 /// loader for the architecture the inspector runs on. The inspector binary only
 /// runs on its own architecture, so its `target_arch` is the machine's.
-/// [`verify_esp_loader`] checks it exists before the entry is written, so an
+/// [`prepare_esp`] checks it exists before the entry is written, so an
 /// image built for another architecture fails the deploy instead of producing a
 /// boot entry the firmware cannot start.
 #[cfg(target_arch = "x86_64")]
@@ -125,6 +135,17 @@ pub const ESP_LOADER_PATH: &str = REMOVABLE_LOADERS[0].1;
 pub const ESP_LOADER_PATH: &str = REMOVABLE_LOADERS[1].1;
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 compile_error!("beskar7-inspector supports x86_64 and aarch64 only (no UEFI removable-media loader path for this architecture)");
+
+/// The ESP subdirectory holding the per-deploy marker `startup.nsh` looks for.
+const MARKER_DIR: &str = "beskar7";
+/// The script the EFI Shell runs at start-up.
+const STARTUP_NSH_FILENAME: &str = "startup.nsh";
+/// Where the EFI Shell's default search path looks for `startup.nsh` on each
+/// filesystem (EDK2: `\efi\tools\`, `\efi\boot\`, then the root). A script in any
+/// of them means the image ships its own, which is left in place.
+const STARTUP_NSH_DIRS: [&[&str]; 3] = [&["EFI", "tools"], &["EFI", "BOOT"], &[]];
+/// How many Shell filesystem mappings (`FS0:`–`FS31:`) the script scans.
+const STARTUP_NSH_MAPPINGS: u32 = 32;
 
 /// The partition a deploy-time mount opens. Names it in errors, and lets the
 /// provision-failed reason tell the ESP check and the `COS_OEM` inject apart.
@@ -167,7 +188,7 @@ const OEM_MOUNT: PrivateMount = PrivateMount {
     read_only: false,
 };
 
-/// The ESP is FAT, and only read (the loader check), so it is mounted read-only.
+/// The ESP is FAT, written with the marker and the `startup.nsh` fallback.
 /// The codepage and charset are explicit so the mount needs only the `nls_cp437`
 /// and `nls_ascii` modules the initramfs ships, whatever the kernel's
 /// `CONFIG_FAT_DEFAULT_*` defaults are (Alpine's iocharset is `utf8`).
@@ -177,7 +198,7 @@ const ESP_MOUNT: PrivateMount = PrivateMount {
     mountpoint: "/run/beskar7-esp",
     fstype: "vfat",
     data: Some("codepage=437,iocharset=ascii"),
-    read_only: true,
+    read_only: false,
 };
 
 // BLKRRPART = _IO(0x12, 95): re-read a block device's partition table.
@@ -315,6 +336,10 @@ pub enum DeployError {
         #[source]
         source: std::io::Error,
     },
+    /// Writing or flushing the marker or the `startup.nsh` fallback on the ESP
+    /// failed (or no random marker could be drawn).
+    #[error("writing the startup.nsh fallback to the ESP")]
+    EspWrite(#[source] std::io::Error),
     /// Unmounting a partition failed.
     #[error("unmounting {part} at {path}")]
     Unmount {
@@ -456,18 +481,55 @@ pub fn reread_partition_table(target: &TargetDisk) -> Result<(), DeployError> {
     Ok(())
 }
 
-/// Mount the located ESP read-only, check its [`ESP_LOADER_PATH`] loader is a
-/// regular file, and unmount — so the UEFI boot entry [`crate::efiboot`] writes
-/// next never points at a missing file.
+/// What [`prepare_esp`] wrote on the ESP.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EspPrepared {
+    /// The random per-deploy marker (`\EFI\beskar7\<marker>.id`).
+    pub marker: String,
+    /// Whether our `startup.nsh` was written, or the image's own left in place.
+    pub startup_nsh: StartupNsh,
+}
+
+/// What happened to `startup.nsh` on the ESP.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StartupNsh {
+    /// Ours was written at the ESP root.
+    Written,
+    /// The image ships its own (at this UEFI path); it was left in place.
+    LeftInPlace(String),
+}
+
+/// Mount the located ESP, check its [`ESP_LOADER_PATH`] loader is a regular file
+/// (so neither the UEFI boot entry nor `startup.nsh` points at a missing file),
+/// write the random per-deploy marker and — when the image has none of its own —
+/// the `startup.nsh` fallback ([`write_esp_fallback`]), and unmount.
 ///
 /// The mount is bound to the ESP's enumerated `major:minor` exactly as for
 /// `COS_OEM` (see [`inject_oem_config`]), and the ESP is **always unmounted before
-/// returning**. A mount or lookup failure on a located ESP is a hard failure: it
-/// points at a bad disk, or an image that cannot boot under UEFI.
-pub fn verify_esp_loader(esp: &EspPartition) -> Result<(), DeployError> {
+/// returning**. Every failure is a hard failure: a missing loader means the image
+/// cannot boot under UEFI, and an I/O error on a located ESP points at a bad disk.
+pub fn prepare_esp(esp: &EspPartition) -> Result<EspPrepared, DeployError> {
+    let marker = new_marker().map_err(DeployError::EspWrite)?;
+    let mut startup_nsh = None;
     with_private_mount(&ESP_MOUNT, &esp.dev_path(), &esp.dev_number, |mnt| {
-        check_loader(mnt, ESP_LOADER_PATH)
+        check_loader(mnt, ESP_LOADER_PATH)?;
+        startup_nsh = Some(write_esp_fallback(mnt, &marker)?);
+        Ok(())
+    })?;
+    Ok(EspPrepared {
+        marker,
+        startup_nsh: startup_nsh.expect("the write closure ran and succeeded"),
     })
+}
+
+/// A random per-deploy marker: 16 hex digits from the kernel's CSPRNG, unrelated
+/// to anything else in the deploy (the bearer token included), so `startup.nsh`
+/// recognises exactly the disk this run wrote.
+fn new_marker() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 8];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Mount the located `COS_OEM` partition, write the per-host Kairos cloud-config
@@ -512,7 +574,7 @@ pub fn inject_oem_config(
 }
 
 /// Mount the partition `dev` (enumerated as `dev_number`) per `spec`, run `write`
-/// against the mount root, and unmount. Shared by [`verify_esp_loader`] and
+/// against the mount root, and unmount. Shared by [`prepare_esp`] and
 /// [`inject_oem_config`]; always removes the private device node afterward.
 fn with_private_mount(
     spec: &PrivateMount,
@@ -702,6 +764,131 @@ fn check_loader(mount_dir: &Path, loader: &'static str) -> Result<(), DeployErro
             source,
         }),
     }
+}
+
+/// The `startup.nsh` that boots the disk carrying `\EFI\beskar7\<marker>.id`:
+/// for each Shell mapping `FS0:`–`FS31:`, if the marker is there, start
+/// [`ESP_LOADER_PATH`] on it. If no mapping has the marker, say so and end, which
+/// leaves the Shell at its prompt. `set -v` keeps the flag a volatile variable
+/// (never written to NVRAM). CRLF line endings, as the EFI Shell expects.
+fn render_startup_nsh(marker: &str) -> String {
+    let last = STARTUP_NSH_MAPPINGS - 1;
+    let loader = ESP_LOADER_PATH;
+    let lines = [
+        "@echo -off".to_string(),
+        format!("# Written by beskar7-inspector: boot the disk provisioned with marker {marker}."),
+        "set -v b7found 0".to_string(),
+        format!("for %i run (0 {last})"),
+        format!("  if exist FS%i:\\EFI\\{MARKER_DIR}\\{marker}.id then"),
+        "    set -v b7found 1".to_string(),
+        format!("    echo beskar7: starting FS%i:{loader}"),
+        format!("    FS%i:{loader}"),
+        format!("    echo beskar7: {loader} on FS%i: returned"),
+        "  endif".to_string(),
+        "endfor".to_string(),
+        "if %b7found% == 0 then".to_string(),
+        format!("  echo beskar7: no disk with marker {marker} found, stopping at the Shell prompt"),
+        "endif".to_string(),
+    ];
+    let mut script = lines.join("\r\n");
+    script.push_str("\r\n");
+    script
+}
+
+/// Write the per-deploy marker `EFI/beskar7/<marker>.id` (removing older ones)
+/// and, unless the image already has a `startup.nsh` where the Shell looks for
+/// one ([`STARTUP_NSH_DIRS`], names compared ignoring case as FAT does), ours at
+/// the ESP root under `mount_dir`; then `fsync` the files and their directories.
+/// An image's own script is never touched. Pure file I/O over an injected
+/// directory, so it is unit-tested against a scratch dir without a mount.
+fn write_esp_fallback(mount_dir: &Path, marker: &str) -> Result<StartupNsh, DeployError> {
+    let io = DeployError::EspWrite;
+    let efi_dir = match child(mount_dir, "EFI").map_err(io)? {
+        Some((_, path)) => path,
+        None => mount_dir.join("EFI"),
+    };
+    let marker_dir = efi_dir.join(MARKER_DIR);
+    fs::create_dir_all(&marker_dir).map_err(io)?;
+    for entry in fs::read_dir(&marker_dir).map_err(io)? {
+        let path = entry.map_err(io)?.path();
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("id"))
+        {
+            fs::remove_file(&path).map_err(io)?;
+        }
+    }
+    write_synced(
+        &marker_dir.join(format!("{marker}.id")),
+        b"beskar7 deploy marker\r\n",
+    )
+    .map_err(io)?;
+
+    let mut outcome = StartupNsh::Written;
+    for dir in STARTUP_NSH_DIRS {
+        let parts: Vec<&str> = dir.iter().copied().chain([STARTUP_NSH_FILENAME]).collect();
+        if let Some(existing) = resolve_file(mount_dir, &parts).map_err(io)? {
+            outcome = StartupNsh::LeftInPlace(existing);
+            break;
+        }
+    }
+    if outcome == StartupNsh::Written {
+        write_synced(
+            &mount_dir.join(STARTUP_NSH_FILENAME),
+            render_startup_nsh(marker).as_bytes(),
+        )
+        .map_err(io)?;
+    }
+    for dir in [&marker_dir, &efi_dir, &mount_dir.to_path_buf()] {
+        File::open(dir).and_then(|d| d.sync_all()).map_err(io)?;
+    }
+    Ok(outcome)
+}
+
+/// The entry of `dir` named `name` ignoring ASCII case: its stored name and path.
+/// `None` when `dir` has no such entry (or `dir` itself doesn't exist).
+fn child(dir: &Path, name: &str) -> std::io::Result<Option<(String, std::path::PathBuf)>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if let Ok(stored) = entry.file_name().into_string() {
+            if stored.eq_ignore_ascii_case(name) {
+                return Ok(Some((stored, entry.path())));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve `parts` under `root` ignoring case: the UEFI path (stored names) of
+/// the regular file it names, or `None` if a part is missing or it isn't a file.
+fn resolve_file(root: &Path, parts: &[&str]) -> std::io::Result<Option<String>> {
+    let mut path = root.to_path_buf();
+    let mut uefi = String::new();
+    for part in parts {
+        let Some((stored, next)) = child(&path, part)? else {
+            return Ok(None);
+        };
+        uefi.push('\\');
+        uefi.push_str(&stored);
+        path = next;
+    }
+    Ok(path.is_file().then_some(uefi))
+}
+
+/// Create (or truncate) `path` with `contents` and `fsync` it.
+fn write_synced(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
 }
 
 /// `sync(2)` then `reboot(2)` into the provisioned OS (contract §9.1 5.4). Does
@@ -983,13 +1170,13 @@ mod tests {
     }
 
     #[test]
-    fn esp_mount_is_read_only_vfat_with_explicit_nls_tables() {
+    fn esp_mount_is_writable_vfat_with_explicit_nls_tables() {
         // The initramfs ships nls_cp437 + nls_ascii (modules.list); the mount must
         // name exactly those rather than rely on the kernel's FAT defaults. The
-        // ESP is only read, so it is mounted read-only; COS_OEM is written.
+        // ESP gets the marker and the startup.nsh fallback, so it is writable.
         assert_eq!(ESP_MOUNT.fstype, "vfat");
         assert_eq!(ESP_MOUNT.data, Some("codepage=437,iocharset=ascii"));
-        const { assert!(ESP_MOUNT.read_only) };
+        const { assert!(!ESP_MOUNT.read_only) };
         const { assert!(!OEM_MOUNT.read_only) };
         assert_ne!(ESP_MOUNT.node, OEM_MOUNT.node);
         assert_ne!(ESP_MOUNT.mountpoint, OEM_MOUNT.mountpoint);
@@ -1011,5 +1198,126 @@ mod tests {
         for bad in ["", "259", "259:", ":3", "a:b", "259:3:1", "8 0"] {
             assert_eq!(parse_dev_number(bad), None, "{bad:?} should not parse");
         }
+    }
+
+    // --- the startup.nsh fallback ------------------------------------------
+
+    const MARKER: &str = "0123456789abcdef";
+
+    /// An ESP-shaped scratch dir with the loader and `files` (`/`-separated).
+    fn esp_with(name: &str, files: &[(&str, &str)]) -> crate::probe::testutil::Scratch {
+        let s = crate::probe::testutil::Scratch::new(name);
+        let loader = ESP_LOADER_PATH.trim_start_matches('\\').replace('\\', "/");
+        crate::probe::testutil::write(s.path(), &loader, "MZ");
+        for (path, contents) in files {
+            crate::probe::testutil::write(s.path(), path, contents);
+        }
+        s
+    }
+
+    #[test]
+    fn startup_nsh_starts_the_removable_loader_on_the_marked_disk() {
+        let script = render_startup_nsh(MARKER);
+        assert!(script.ends_with("\r\n"));
+        assert_eq!(
+            script.matches('\n').count(),
+            script.matches("\r\n").count(),
+            "no bare LF line endings"
+        );
+        let loader = ESP_LOADER_PATH;
+        let lines: Vec<&str> = script.split("\r\n").collect();
+        assert_eq!(
+            lines,
+            [
+                "@echo -off".to_string(),
+                "# Written by beskar7-inspector: boot the disk provisioned with marker 0123456789abcdef.".to_string(),
+                "set -v b7found 0".to_string(),
+                "for %i run (0 31)".to_string(),
+                r"  if exist FS%i:\EFI\beskar7\0123456789abcdef.id then".to_string(),
+                "    set -v b7found 1".to_string(),
+                format!("    echo beskar7: starting FS%i:{loader}"),
+                format!("    FS%i:{loader}"),
+                format!("    echo beskar7: {loader} on FS%i: returned"),
+                "  endif".to_string(),
+                "endfor".to_string(),
+                "if %b7found% == 0 then".to_string(),
+                "  echo beskar7: no disk with marker 0123456789abcdef found, stopping at the Shell prompt".to_string(),
+                "endif".to_string(),
+                String::new(),
+            ]
+        );
+    }
+
+    #[test]
+    fn writes_the_marker_and_our_script_when_the_image_has_none() {
+        let s = esp_with("esp-fb-none", &[("EFI/beskar7/feedfacecafebeef.id", "old")]);
+        assert_eq!(
+            write_esp_fallback(s.path(), MARKER).unwrap(),
+            StartupNsh::Written
+        );
+        let markers: Vec<String> = std::fs::read_dir(s.path().join("EFI/beskar7"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(
+            markers,
+            vec![format!("{MARKER}.id")],
+            "the older marker is removed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(s.path().join("startup.nsh")).unwrap(),
+            render_startup_nsh(MARKER)
+        );
+    }
+
+    #[test]
+    fn an_image_script_is_left_in_place_wherever_the_shell_finds_it() {
+        const IMAGE_NSH: &str = "echo the image's own script\r\n";
+        for (name, at, uefi) in [
+            ("esp-fb-root", "startup.nsh", r"\startup.nsh"),
+            ("esp-fb-upper", "STARTUP.NSH", r"\STARTUP.NSH"),
+            (
+                "esp-fb-boot",
+                "EFI/BOOT/startup.nsh",
+                r"\EFI\BOOT\startup.nsh",
+            ),
+            (
+                "esp-fb-tools",
+                "EFI/tools/startup.nsh",
+                r"\EFI\tools\startup.nsh",
+            ),
+        ] {
+            let s = esp_with(name, &[(at, IMAGE_NSH)]);
+            assert_eq!(
+                write_esp_fallback(s.path(), MARKER).unwrap(),
+                StartupNsh::LeftInPlace(uefi.to_string()),
+                "{name}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(s.path().join(at)).unwrap(),
+                IMAGE_NSH,
+                "{name}"
+            );
+            if at != "startup.nsh" && at != "STARTUP.NSH" {
+                assert!(
+                    !s.path().join("startup.nsh").exists(),
+                    "{name}: ours not written"
+                );
+            }
+            // The marker is written all the same.
+            assert!(
+                s.path().join(format!("EFI/beskar7/{MARKER}.id")).is_file(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn markers_are_random_16_hex_digits() {
+        let a = new_marker().unwrap();
+        let b = new_marker().unwrap();
+        assert_eq!(a.len(), 16);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
     }
 }
