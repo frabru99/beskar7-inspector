@@ -15,7 +15,7 @@
 //! write the digest-pinned image to the disk             deploy::write_image
 //! re-read the partition table                           deploy::reread_partition_table
 //! locate the ESP on the target disk (UEFI boot only)    esp::find_esp_partition
-//! mount the ESP read-only, check its loader             deploy::verify_esp_loader
+//! check its loader, write marker (+ startup.nsh)       deploy::prepare_esp
 //! add/reuse its Boot####, place it after network ones   efiboot::ensure_disk_boot_entry
 //!   (an NVRAM failure is logged, not fatal)
 //! locate COS_OEM on the target disk                     oem::find_oem_partition
@@ -274,7 +274,11 @@ fn run_deploy_steps(
             }
             register_boot_entry(
                 esp,
-                deploy::verify_esp_loader,
+                |esp| {
+                    let prepared = deploy::prepare_esp(esp)?;
+                    eprintln!("beskar7-inspector: {}", esp_prepared_line(&prepared, esp));
+                    Ok(())
+                },
                 efiboot::ensure_disk_boot_entry,
             )
         },
@@ -360,6 +364,22 @@ fn boot_entry_line(result: &Result<BootEntry, EfiBootError>, esp: &EspPartition)
     }
 }
 
+/// The console line for [`deploy::prepare_esp`]'s outcome: the marker, and whether
+/// our `startup.nsh` was written or the image's own left in place.
+fn esp_prepared_line(prepared: &deploy::EspPrepared, esp: &EspPartition) -> String {
+    let dev = esp.dev_path();
+    let marker = &prepared.marker;
+    match &prepared.startup_nsh {
+        deploy::StartupNsh::Written => {
+            format!("ESP {dev} prepared: marker {marker}, startup.nsh fallback written")
+        }
+        deploy::StartupNsh::LeftInPlace(path) => format!(
+            "ESP {dev} prepared: marker {marker}; the image's own {path} left in place, \
+             no startup.nsh fallback written"
+        ),
+    }
+}
+
 /// A short, secret-free reason string for the provision-failed callback, derived
 /// from which Phase 2 step failed. The strings name the failing step only — never
 /// the image bytes, the join secret, device names or paths, or status codes — so
@@ -428,6 +448,7 @@ fn deploy_error_reason(e: &DeployError) -> &'static str {
         DeployError::EspLoaderMissing { .. } | DeployError::EspLoaderCheck { .. } => {
             "ESP loader check failed"
         }
+        DeployError::EspWrite(_) => "ESP write failed",
         DeployError::ConfigWrite(_) | DeployError::ProviderIdWrite(_) => "COS_OEM inject failed",
         // reboot_now's error never flows through run_deploy_steps (it runs after a
         // successful deploy), but keep the match total.
@@ -1087,5 +1108,34 @@ mod tests {
         assert!(matches!(out, Err(RunError::BootstrapTimeout)));
         assert_eq!(calls.get(), 3); // exactly max_polls attempts
         assert_eq!(sleeps.get(), 2); // no sleep after the final attempt
+    }
+
+    // --- the ESP preparation line and reason --------------------------------
+
+    #[test]
+    fn esp_prepared_line_says_whether_our_script_was_written() {
+        let prepared = |startup_nsh| deploy::EspPrepared {
+            marker: "0123456789abcdef".into(),
+            startup_nsh,
+        };
+        assert_eq!(
+            esp_prepared_line(&prepared(deploy::StartupNsh::Written), &located_esp()),
+            "ESP /dev/sda1 prepared: marker 0123456789abcdef, startup.nsh fallback written"
+        );
+        assert_eq!(
+            esp_prepared_line(
+                &prepared(deploy::StartupNsh::LeftInPlace(r"\startup.nsh".into())),
+                &located_esp()
+            ),
+            r"ESP /dev/sda1 prepared: marker 0123456789abcdef; the image's own \startup.nsh left in place, no startup.nsh fallback written"
+        );
+    }
+
+    #[test]
+    fn an_esp_write_failure_has_its_own_reason() {
+        assert_eq!(
+            deploy_error_reason(&DeployError::EspWrite(std::io::Error::other("x"))),
+            "ESP write failed"
+        );
     }
 }
