@@ -77,15 +77,21 @@ parameters on the kernel cmdline. The inspector then runs two phases:
 2. **Provision** (when bootstrap data is ready) — `GET` the CAPI bootstrap
    user-data, stream the digest-pinned whole-disk OS image (a Kairos raw image)
    onto the selected disk while verifying its SHA-256, register a UEFI boot
-   entry for the image's ESP loader — the removable-media path for the
-   inspector's architecture, `\EFI\BOOT\BOOTX64.EFI` on x86_64 and
-   `\EFI\BOOT\BOOTAA64.EFI` on aarch64 (an image without it fails the deploy) —
-   reusing the firmware's own entry for that partition if there is one, right
-   after the network entries in `BootOrder`,
-   so the first boot finds the disk without an NVRAM entry of its own (skipped
-   on legacy BIOS boots and for images without an ESP), inject a per-host
-   cloud-config (carrying the join secret) into the image's `COS_OEM` partition,
-   and `reboot(2)` into the provisioned OS.
+   entry for the image's ESP loader, inject a per-host cloud-config (carrying
+   the join secret) into the image's `COS_OEM` partition, and `reboot(2)` into
+   the provisioned OS.
+
+   The boot entry starts the removable-media loader for the inspector's
+   architecture, `\EFI\BOOT\BOOTX64.EFI` on x86_64 and `\EFI\BOOT\BOOTAA64.EFI`
+   on aarch64; an image whose ESP lacks it fails the deploy. An existing entry
+   that already starts that loader on that partition is reused; otherwise the
+   previous `beskar7` entry is overwritten, or a new one created. It goes in
+   `BootOrder` right after the network entries that lead it (counting only
+   entries the firmware boots on its own), or first when the boot order doesn't
+   start with network. A firmware that refuses the NVRAM write (boot order locked
+   in setup, NVRAM full) is logged and left to find the loader itself; legacy
+   BIOS boots and images without an ESP skip the step. Another disk carrying a
+   partition with the same GUID is logged, since the firmware may boot either.
 
 ```
 power on → PXE → controller-rendered iPXE → inspector

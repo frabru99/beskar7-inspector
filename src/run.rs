@@ -17,6 +17,7 @@
 //! locate the ESP on the target disk (UEFI boot only)    esp::find_esp_partition
 //! mount the ESP read-only, check its loader             deploy::verify_esp_loader
 //! add/reuse its Boot####, place it after network ones   efiboot::ensure_disk_boot_entry
+//!   (an NVRAM failure is logged, not fatal)
 //! locate COS_OEM on the target disk                     oem::find_oem_partition
 //! mount COS_OEM, inject 99_beskar7.yaml + provider-id   deploy::inject_oem_config
 //! zero the user-data buffer                             drop(user_data)
@@ -48,7 +49,7 @@ use zeroize::Zeroizing;
 use crate::client::{CallbackClient, ClientError};
 use crate::cmdline::{BootParams, CmdlineError};
 use crate::deploy::{self, DeployError, Part};
-use crate::efiboot::{self, EfiBootError};
+use crate::efiboot::{self, BootEntry, EfiBootError};
 use crate::esp::{self, EspError, EspPartition};
 use crate::image::DEFAULT_MAX_IMAGE_BYTES;
 use crate::net::{self, NetError};
@@ -100,9 +101,6 @@ pub enum RunError {
     /// Locating the EFI System Partition on the target disk failed.
     #[error(transparent)]
     Esp(#[from] EspError),
-    /// Registering the UEFI boot entry for the disk failed.
-    #[error(transparent)]
-    EfiBoot(#[from] EfiBootError),
     /// Locating the `COS_OEM` partition on the target disk failed.
     #[error(transparent)]
     Oem(#[from] OemError),
@@ -267,21 +265,18 @@ fn run_deploy_steps(
         std::path::Path::new(crate::probe::system::EFI_SYSFS_PATH).exists(),
         || esp::find_esp_partition(target),
         |esp| {
-            deploy::verify_esp_loader(esp)?;
-            let entry = efiboot::ensure_disk_boot_entry(esp)?;
-            let order: Vec<String> = entry
-                .boot_order
-                .iter()
-                .map(|n| format!("{n:04X}"))
-                .collect();
-            eprintln!(
-                "beskar7-inspector: UEFI boot entry Boot{:04X} {} for {} (BootOrder {})",
-                entry.number,
-                if entry.created { "created" } else { "reused" },
-                esp.dev_path(),
-                order.join(",")
-            );
-            Ok(())
+            for disk in esp::other_disks_with_guid(target, &esp.gpt.unique_guid) {
+                eprintln!(
+                    "beskar7-inspector: warning: /dev/{disk} also has a partition with the ESP's \
+                     GUID {}; the firmware may boot either disk",
+                    esp::guid_string(&esp.gpt.unique_guid)
+                );
+            }
+            register_boot_entry(
+                esp,
+                deploy::verify_esp_loader,
+                efiboot::ensure_disk_boot_entry,
+            )
         },
     )?;
     let oem_partition = oem::find_oem_partition(target)?;
@@ -293,8 +288,8 @@ fn run_deploy_steps(
 /// `register` (check its loader, write the boot entry) so the skip policy is
 /// unit-tested. On a legacy BIOS boot (`efi` false) there is no NVRAM to write, and
 /// an image with no GPT or no ESP ([`EspError::is_absent`]) has nothing to point
-/// an entry at: both log and skip. Every other failure — a GPT read error, an I/O
-/// error on a located ESP, a refused NVRAM write — is returned (hard failure).
+/// an entry at: both log and skip. A GPT read error is returned (hard failure), as
+/// is whatever `register` returns.
 fn esp_boot_entry_step(
     efi: bool,
     find: impl FnOnce() -> Result<EspPartition, EspError>,
@@ -314,6 +309,57 @@ fn esp_boot_entry_step(
     }
 }
 
+/// Check the located ESP's loader (`verify`), then register its UEFI boot entry
+/// (`ensure`), both injected so the failure policy is unit-tested:
+///   * a `verify` failure — no loader, or an I/O error mounting/reading the ESP —
+///     points at the image or the disk and is returned (hard failure): a disk
+///     without the loader cannot boot under UEFI anyway;
+///   * an `ensure` failure — efivarfs mount, NVRAM read or write (boot order locked
+///     in setup, NVRAM full, …) — is logged and the deploy carries on. The firmware's
+///     removable-media fallback can still boot the disk, so the host is never worse
+///     off than without the boot entry.
+fn register_boot_entry(
+    esp: &EspPartition,
+    verify: impl FnOnce(&EspPartition) -> Result<(), DeployError>,
+    ensure: impl FnOnce(&EspPartition) -> Result<BootEntry, EfiBootError>,
+) -> Result<(), RunError> {
+    verify(esp)?;
+    eprintln!("beskar7-inspector: {}", boot_entry_line(&ensure(esp), esp));
+    Ok(())
+}
+
+/// The console line for [`register_boot_entry`]'s outcome, e.g. `UEFI boot entry
+/// Boot0006 created for /dev/vda1 (BootOrder 0000,0001 -> 0000,0006,0001)`, or the
+/// warning (with the underlying errno) when the NVRAM refused it.
+fn boot_entry_line(result: &Result<BootEntry, EfiBootError>, esp: &EspPartition) -> String {
+    let order = |o: &[u16]| {
+        o.iter()
+            .map(|n| format!("{n:04X}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    match result {
+        Ok(entry) => format!(
+            "UEFI boot entry Boot{:04X} {} for {} (BootOrder {} -> {})",
+            entry.number,
+            entry.outcome,
+            esp.dev_path(),
+            order(&entry.previous_order),
+            order(&entry.boot_order)
+        ),
+        Err(e) => {
+            let cause = std::error::Error::source(e)
+                .map(|s| format!(": {s}"))
+                .unwrap_or_default();
+            format!(
+                "warning: UEFI boot entry not registered ({e}{cause}); leaving the firmware's \
+                 removable-media fallback to boot {}",
+                esp.dev_path()
+            )
+        }
+    }
+}
+
 /// A short, secret-free reason string for the provision-failed callback, derived
 /// from which Phase 2 step failed. The strings name the failing step only — never
 /// the image bytes, the join secret, device names or paths, or status codes — so
@@ -329,12 +375,10 @@ fn provision_failure_reason(e: &RunError) -> &'static str {
         // Reading or parsing the freshly-written GPT failed. (No GPT / no ESP is a
         // skip, not an error, so it never reaches here.)
         RunError::Esp(_) => "ESP GPT read failed",
-        // Mounting efivarfs, or reading/writing Boot#### / BootOrder, failed.
-        RunError::EfiBoot(_) => "UEFI boot entry failed",
         // find_oem_partition failed — the freshly-written image had no locatable
         // COS_OEM partition to inject into.
         RunError::Oem(_) => "COS_OEM partition not found",
-        // Only Disk/Deploy/Esp/EfiBoot/Oem errors are reported, but keep the match total so a
+        // Only Disk/Deploy/Esp/Oem errors are reported, but keep the match total so a
         // future step cannot silently fall through without a reason.
         _ => "deploy failed",
     }
@@ -721,13 +765,6 @@ mod tests {
             provision_failure_reason(&RunError::Esp(EspError::BadGpt { disk: "sda".into() })),
             "ESP GPT read failed"
         );
-        assert_eq!(
-            provision_failure_reason(&RunError::EfiBoot(EfiBootError::WriteVar {
-                name: "BootOrder".into(),
-                source: std::io::Error::other("x"),
-            })),
-            "UEFI boot entry failed"
-        );
         // A whole-disk open/identity failure while reading the GPT is a disk error.
         assert_eq!(
             provision_failure_reason(&RunError::Esp(EspError::Device(
@@ -833,20 +870,78 @@ mod tests {
         assert_eq!(provision_failure_reason(&err), "ESP loader check failed");
     }
 
+    fn boot_entry(outcome: efiboot::Outcome) -> BootEntry {
+        BootEntry {
+            number: 6,
+            outcome,
+            previous_order: vec![0, 1],
+            boot_order: vec![0, 6, 1],
+        }
+    }
+
     #[test]
-    fn esp_step_fails_hard_on_a_refused_nvram_write() {
-        let got = esp_boot_entry_step(
-            true,
-            || Ok(located_esp()),
+    fn a_refused_nvram_write_does_not_fail_the_deploy() {
+        // Boot order locked in setup, NVRAM full, efivarfs missing: logged, and the
+        // deploy carries on to COS_OEM — never worse than without the entry.
+        for e in [
+            EfiBootError::WriteVar {
+                name: "Boot0001".into(),
+                source: std::io::Error::from_raw_os_error(nix::libc::ENOSPC),
+            },
+            EfiBootError::Mount(nix::errno::Errno::ENODEV),
+            EfiBootError::BadBootOrder,
+        ] {
+            let got = register_boot_entry(&located_esp(), |_| Ok(()), |_| Err(e));
+            assert!(got.is_ok(), "an NVRAM failure is not a deploy failure");
+        }
+    }
+
+    #[test]
+    fn a_located_esp_without_its_loader_still_fails_the_deploy() {
+        let ensured = std::cell::Cell::new(false);
+        let got = register_boot_entry(
+            &located_esp(),
             |_| {
-                Err(RunError::EfiBoot(EfiBootError::WriteVar {
-                    name: "Boot0001".into(),
-                    source: std::io::Error::from_raw_os_error(nix::libc::EIO),
-                }))
+                Err(DeployError::EspLoaderMissing {
+                    path: deploy::ESP_LOADER_PATH,
+                })
+            },
+            |_| {
+                ensured.set(true);
+                Ok(boot_entry(efiboot::Outcome::Created))
             },
         );
         let err = got.unwrap_err();
-        assert_eq!(provision_failure_reason(&err), "UEFI boot entry failed");
+        assert_eq!(provision_failure_reason(&err), "ESP loader check failed");
+        assert!(
+            !ensured.get(),
+            "no NVRAM write for an ESP that failed the check"
+        );
+    }
+
+    #[test]
+    fn boot_entry_line_shows_the_order_before_and_after() {
+        assert_eq!(
+            boot_entry_line(&Ok(boot_entry(efiboot::Outcome::Replaced)), &located_esp()),
+            "UEFI boot entry Boot0006 replaced for /dev/sda1 (BootOrder 0000,0001 -> 0000,0006,0001)"
+        );
+        let warning = boot_entry_line(
+            &Err(EfiBootError::WriteVar {
+                name: "BootOrder".into(),
+                source: std::io::Error::from_raw_os_error(nix::libc::ENOSPC),
+            }),
+            &located_esp(),
+        );
+        assert!(
+            warning.starts_with(
+                "warning: UEFI boot entry not registered (writing UEFI variable BootOrder: "
+            ),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("removable-media fallback to boot /dev/sda1"),
+            "{warning}"
+        );
     }
 
     #[test]

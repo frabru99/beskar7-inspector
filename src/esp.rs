@@ -151,17 +151,71 @@ pub fn find_esp_partition(target: &TargetDisk) -> Result<EspPartition, EspError>
     deploy::verify_node_identity(&file, &path, &target.dev_number)?;
 
     let block_dir = Path::new(SYSFS_BLOCK);
-    let block_size = read_trimmed(
-        &block_dir
-            .join(&target.kname)
-            .join("queue/logical_block_size"),
-    )
-    .and_then(|s| s.parse::<u64>().ok())
-    .filter(|n| *n >= DEFAULT_BLOCK_SIZE && n.is_power_of_two())
-    .unwrap_or(DEFAULT_BLOCK_SIZE);
-
+    let block_size = logical_block_size(block_dir, &target.kname);
     let entries = read_esp_entries(&mut file, block_size, &target.kname)?;
     find_esp_in(block_dir, &target.kname, &entries)
+}
+
+/// The other disks that carry a partition with the unique GUID `guid` — a second
+/// disk holding the same image, for instance. A short-form `HD()` boot entry names
+/// only the GUID, so the firmware may start the loader of either disk. Diagnostic
+/// only: every disk that can't be opened or has no readable GPT is skipped.
+pub fn other_disks_with_guid(target: &TargetDisk, guid: &[u8; 16]) -> Vec<String> {
+    other_disks_with_guid_in(Path::new(SYSFS_BLOCK), &target.kname, guid, |kname, bs| {
+        let mut file = File::open(format!("/dev/{kname}")).ok()?;
+        read_gpt_entries(&mut file, bs, kname).ok()
+    })
+}
+
+/// [`other_disks_with_guid`] over an injected `/sys/block`-shaped `block_dir` and
+/// GPT reader (`kname`, logical block size → entries), so it is unit-tested without
+/// real disks. Virtual devices (`loop`, `ram`, `zram`, `dm-`, `md`) and optical
+/// drives (`sr`) are skipped, as is the target.
+fn other_disks_with_guid_in(
+    block_dir: &Path,
+    target: &str,
+    guid: &[u8; 16],
+    read_gpt: impl Fn(&str, u64) -> Option<Vec<GptEntry>>,
+) -> Vec<String> {
+    const SKIPPED: [&str; 6] = ["loop", "ram", "zram", "dm-", "md", "sr"];
+    let Ok(dir) = std::fs::read_dir(block_dir) else {
+        return Vec::new();
+    };
+    let mut disks: Vec<String> = dir
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|k| k != target && !SKIPPED.iter().any(|p| k.starts_with(p)))
+        .filter(|k| {
+            read_gpt(k, logical_block_size(block_dir, k))
+                .is_some_and(|entries| entries.iter().any(|e| e.part.unique_guid == *guid))
+        })
+        .collect();
+    disks.sort();
+    disks
+}
+
+/// A disk's logical block size from sysfs, or [`DEFAULT_BLOCK_SIZE`] when it isn't
+/// reported (or isn't a plausible power of two).
+fn logical_block_size(block_dir: &Path, kname: &str) -> u64 {
+    read_trimmed(&block_dir.join(kname).join("queue/logical_block_size"))
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n >= DEFAULT_BLOCK_SIZE && n.is_power_of_two())
+        .unwrap_or(DEFAULT_BLOCK_SIZE)
+}
+
+/// `guid` (16 bytes as stored on disk, mixed-endian) in the usual
+/// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` form.
+pub fn guid_string(guid: &[u8; 16]) -> String {
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let rev = |b: &[u8]| hex(&b.iter().rev().copied().collect::<Vec<u8>>());
+    format!(
+        "{}-{}-{}-{}-{}",
+        rev(&guid[0..4]),
+        rev(&guid[4..6]),
+        rev(&guid[6..8]),
+        hex(&guid[8..10]),
+        hex(&guid[10..16])
+    )
 }
 
 /// The layout of the GPT entry table, from the header.
@@ -205,20 +259,39 @@ fn parse_gpt_header(header: &[u8], disk: &str) -> Result<GptLayout, EspError> {
 }
 
 /// The GPT entries whose type GUID is the ESP's, by ascending 1-based number.
-/// Entry `n` is the partition the kernel exposes with `partition` == `n`. Each
-/// entry holds the type GUID (bytes `0..16`), the unique GUID (`16..32`), and the
-/// first and last LBA (`32..40`, `40..48`, little-endian).
-fn esp_entries(entries: &[u8], entry_size: usize) -> Vec<GptEsp> {
+/// Entry `n` is the partition the kernel exposes with `partition` == `n`.
+fn esp_entries(entries: &[GptEntry]) -> Vec<GptEsp> {
+    entries
+        .iter()
+        .filter(|e| e.type_guid == ESP_TYPE_GUID)
+        .map(|e| e.part.clone())
+        .collect()
+}
+
+/// One used GPT entry: its partition type GUID and its [`GptEsp`]-shaped fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GptEntry {
+    type_guid: [u8; 16],
+    part: GptEsp,
+}
+
+/// Every used entry (non-zero type GUID) of a raw GPT entry table, by ascending
+/// 1-based number. Each entry holds the type GUID (bytes `0..16`), the unique GUID
+/// (`16..32`), and the first and last LBA (`32..40`, `40..48`, little-endian).
+fn gpt_entries(entries: &[u8], entry_size: usize) -> Vec<GptEntry> {
     let u64_at = |e: &[u8], o: usize| u64::from_le_bytes(e[o..o + 8].try_into().unwrap());
     entries
         .chunks_exact(entry_size)
         .zip(1u32..)
-        .filter(|(entry, _)| entry[..16] == ESP_TYPE_GUID)
-        .map(|(entry, number)| GptEsp {
-            number,
-            unique_guid: entry[16..32].try_into().unwrap(),
-            first_lba: u64_at(entry, 32),
-            last_lba: u64_at(entry, 40),
+        .filter(|(entry, _)| entry[..16] != [0u8; 16])
+        .map(|(entry, number)| GptEntry {
+            type_guid: entry[..16].try_into().unwrap(),
+            part: GptEsp {
+                number,
+                unique_guid: entry[16..32].try_into().unwrap(),
+                first_lba: u64_at(entry, 32),
+                last_lba: u64_at(entry, 40),
+            },
         })
         .collect()
 }
@@ -231,6 +304,15 @@ fn read_esp_entries<R: Read + Seek>(
     block_size: u64,
     disk: &str,
 ) -> Result<Vec<GptEsp>, EspError> {
+    Ok(esp_entries(&read_gpt_entries(dev, block_size, disk)?))
+}
+
+/// Read the GPT header and entry table from `dev` and return every used entry.
+fn read_gpt_entries<R: Read + Seek>(
+    dev: &mut R,
+    block_size: u64,
+    disk: &str,
+) -> Result<Vec<GptEntry>, EspError> {
     let io_err = |source| EspError::ReadGpt {
         disk: disk.to_string(),
         source,
@@ -250,7 +332,7 @@ fn read_esp_entries<R: Read + Seek>(
     let mut entries = vec![0u8; layout.count as usize * layout.entry_size as usize];
     dev.seek(SeekFrom::Start(offset)).map_err(io_err)?;
     dev.read_exact(&mut entries).map_err(io_err)?;
-    Ok(esp_entries(&entries, layout.entry_size as usize))
+    Ok(gpt_entries(&entries, layout.entry_size as usize))
 }
 
 /// Pure locator over an injected `/sys/block`-shaped `block_dir`: the target disk's
@@ -517,5 +599,58 @@ mod tests {
         write_partitions(s.path(), "sdb", &[("sdb1", 1)]); // decoy
         let err = find_esp_in(s.path(), "sda", &[gpt_esp(1)]).unwrap_err();
         assert!(matches!(err, EspError::NotFound { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn reads_every_used_gpt_entry_with_its_type() {
+        let disk = gpt_disk(512, &[ESP_TYPE_GUID, LINUX_FS_GUID]);
+        let got = read_gpt_entries(&mut Cursor::new(disk), 512, "sda").unwrap();
+        assert_eq!(got.len(), 2, "unused (zero-type) entries are skipped");
+        assert_eq!(got[0].type_guid, ESP_TYPE_GUID);
+        assert_eq!(got[1].type_guid, LINUX_FS_GUID);
+        assert_eq!(got[1].part.number, 2);
+        assert_eq!(got[1].part.unique_guid, unique_guid(1));
+    }
+
+    #[test]
+    fn guid_string_is_the_canonical_form() {
+        assert_eq!(
+            guid_string(&ESP_TYPE_GUID),
+            "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+        );
+    }
+
+    #[test]
+    fn finds_other_disks_carrying_the_esp_guid() {
+        let s = Scratch::new("esp-dupes");
+        for disk in ["sda", "sdb", "nvme0n1", "loop0", "dm-0", "sr0"] {
+            write(
+                s.path(),
+                &format!("{disk}/queue/logical_block_size"),
+                "512\n",
+            );
+        }
+        let guid = [0x42; 16];
+        let entry = |g: [u8; 16]| GptEntry {
+            type_guid: ESP_TYPE_GUID,
+            part: GptEsp {
+                unique_guid: g,
+                ..gpt_esp(1)
+            },
+        };
+        // sda = target; sdb and nvme0n1 carry the GUID; loop0/dm-0/sr0 would too,
+        // but virtual and optical devices are skipped; an unreadable disk is ignored.
+        let got = other_disks_with_guid_in(s.path(), "sda", &guid, |k, bs| {
+            assert_eq!(bs, 512);
+            match k {
+                "sdb" | "nvme0n1" | "loop0" | "dm-0" | "sr0" | "sda" => Some(vec![entry(guid)]),
+                _ => None,
+            }
+        });
+        assert_eq!(got, vec!["nvme0n1".to_string(), "sdb".to_string()]);
+        // No other disk with that GUID.
+        let none =
+            other_disks_with_guid_in(s.path(), "sda", &guid, |_, _| Some(vec![entry([0x11; 16])]));
+        assert!(none.is_empty());
     }
 }

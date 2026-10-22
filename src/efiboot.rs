@@ -3,23 +3,36 @@
 //!
 //! The first reboot after the whole-disk write has no NVRAM boot entry for the new
 //! disk. [`ensure_disk_boot_entry`] gives it one, then places it in `BootOrder`:
-//!   1. **Reuse** an active `Boot####` whose device path already names the ESP's
-//!      unique partition GUID — the firmware's own entry for the disk, or the one a
-//!      previous inspector attempt created on this host.
-//!   2. Otherwise **create** one at the lowest free `Boot####`: a short-form
-//!      `HD(<n>,GPT,<guid>,<start>,<size>)/File(`[`ESP_LOADER_PATH`]`)` device path,
-//!      the shape `efibootmgr` writes by default, which the firmware expands.
-//!   3. Move it in `BootOrder` to **right after the last network entry** (a device
-//!      path with a MAC, IPv4, IPv6 or URI node), or first if there is none. PXE
-//!      keeps priority, so the controller can still re-drive the host; when its
-//!      iPXE script exits, the firmware falls through to the disk.
+//!   1. **Reuse** an active `Boot####` that starts exactly what was just written:
+//!      its `HD()` node names the ESP (unique GUID, partition number, start and
+//!      size all match the GPT), and its `File()` path is [`ESP_LOADER_PATH`]
+//!      (ignoring case, FAT is case-insensitive) or absent (a path ending at the
+//!      partition boots that same removable-media loader). That is the firmware's
+//!      own entry for the disk, or the one a previous attempt created. An entry
+//!      for the same GUID that starts another file (a distro loader, or a loader
+//!      of an earlier image built from the same base) is not reused.
+//!   2. Otherwise write a short-form
+//!      `HD(<n>,GPT,<guid>,<start>,<size>)/File(`[`ESP_LOADER_PATH`]`)` entry, the
+//!      shape `efibootmgr` writes by default. It **replaces** an existing entry
+//!      described `beskar7` (the lowest-numbered one), so redeploying images with
+//!      different ESP GUIDs doesn't pile up dead entries in a small NVRAM; only when
+//!      there is none is the lowest free `Boot####` **created**.
+//!   3. Move it in `BootOrder` to **right after the network entries that lead the
+//!      boot order** (device paths with a MAC, IPv4, IPv6 or URI node), counting
+//!      only entries the firmware would boot on its own: active, BOOT category.
+//!      Inactive and APP-category entries (setup, boot menu, often the shell) and
+//!      numbers with no `Boot####` keep their places and are skipped over. When the
+//!      first bootable entry isn't network, the disk goes right before it. PXE
+//!      keeps the priority it had; when it didn't come first, the controller's
+//!      one-time network-boot override already handles reprovisioning.
 //!
 //! ## Writing variables
 //! An `efivarfs` file holds the 4-byte attributes followed by the value, and a
 //! write must hand both to the kernel in **one** `write(2)`. A variable the kernel
-//! marks immutable has `FS_IMMUTABLE_FL` cleared first, as libefivar does. Every
-//! read or write failure is fatal ([`EfiBootError`]): the NVRAM state is left as
-//! the firmware has it, and the deploy aborts before `COS_OEM` is written.
+//! marks immutable has `FS_IMMUTABLE_FL` cleared first, as libefivar does. Any
+//! failure is returned as [`EfiBootError`]; the caller logs it and carries on,
+//! since a firmware that refuses `SetVariable` (boot order locked in setup, full
+//! NVRAM) still finds the removable-media loader on its own.
 //!
 //! ## Secret hygiene (§9)
 //! No secrets pass through here. [`EfiBootError`] carries only variable names and
@@ -46,6 +59,10 @@ const EFI_GLOBAL_GUID: &str = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
 const EFI_VARIABLE_ATTRS: u32 = 0x07;
 /// `LOAD_OPTION_ACTIVE`: the firmware only boots active load options.
 const LOAD_OPTION_ACTIVE: u32 = 0x01;
+/// `LOAD_OPTION_CATEGORY` mask. `0` is `CATEGORY_BOOT`, the only category the
+/// firmware boots on its own; `CATEGORY_APP` (`0x100`) entries run only when picked
+/// from a menu.
+const LOAD_OPTION_CATEGORY: u32 = 0x1F00;
 /// The description of the entry the inspector creates (shown in the boot menu).
 const DESCRIPTION: &str = "beskar7";
 /// `FS_IMMUTABLE_FL`, from `linux/fs.h`.
@@ -118,13 +135,36 @@ pub enum EfiBootError {
     NoFreeEntry,
 }
 
+/// How the boot entry was obtained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// A new `Boot####` was written.
+    Created,
+    /// An existing entry already starts the disk's loader; nothing was written.
+    Reused,
+    /// The previous `beskar7` entry was overwritten for this disk.
+    Replaced,
+}
+
+impl std::fmt::Display for Outcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Outcome::Created => "created",
+            Outcome::Reused => "reused",
+            Outcome::Replaced => "replaced",
+        })
+    }
+}
+
 /// The registered boot entry.
 #[derive(Debug, PartialEq, Eq)]
 pub struct BootEntry {
     /// The `Boot####` number.
     pub number: u16,
-    /// Whether the inspector created it (`false`: an existing entry was reused).
-    pub created: bool,
+    /// Whether it was created, reused or replaced.
+    pub outcome: Outcome,
+    /// `BootOrder` as the firmware had it before this run.
+    pub previous_order: Vec<u16>,
     /// The resulting `BootOrder`.
     pub boot_order: Vec<u16>,
 }
@@ -137,9 +177,80 @@ struct LoadOption {
     device_path: Vec<u8>,
 }
 
+/// The fields of a GPT `HD()` device-path node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HdNode {
+    number: u32,
+    start: u64,
+    size: u64,
+    guid: [u8; 16],
+}
+
+impl HdNode {
+    /// Whether this node names exactly the partition `gpt` describes.
+    fn is(&self, gpt: &GptEsp) -> bool {
+        self.guid == gpt.unique_guid
+            && self.number == gpt.number
+            && self.start == gpt.first_lba
+            && self.size == gpt.size_lba()
+    }
+}
+
 impl LoadOption {
     fn is_active(&self) -> bool {
         self.attributes & LOAD_OPTION_ACTIVE != 0
+    }
+
+    /// Whether the firmware would boot this entry on its own: active and BOOT
+    /// category. `LOAD_OPTION_HIDDEN` only hides it from the menu, so it doesn't
+    /// matter here.
+    fn is_auto_bootable(&self) -> bool {
+        self.is_active() && self.attributes & LOAD_OPTION_CATEGORY == 0
+    }
+
+    /// The first GPT `HD()` node of the device path.
+    fn hd(&self) -> Option<HdNode> {
+        device_path_nodes(&self.device_path)
+            .into_iter()
+            .find_map(|(ty, sub, data)| {
+                // data: number 0..4, start 4..12, size 12..20, signature 20..36,
+                // MBR type 36, signature type 37.
+                (ty == DP_MEDIA && sub == DP_MEDIA_HD && data.len() >= 38 && data[37] == HD_GPT)
+                    .then(|| HdNode {
+                        number: u32::from_le_bytes(data[0..4].try_into().unwrap()),
+                        start: u64::from_le_bytes(data[4..12].try_into().unwrap()),
+                        size: u64::from_le_bytes(data[12..20].try_into().unwrap()),
+                        guid: data[20..36].try_into().unwrap(),
+                    })
+            })
+    }
+
+    /// The file the entry starts on its partition: the `File()` nodes after the
+    /// `HD()` node, joined (UEFI allows a path split across several nodes) with
+    /// backslashes normalized and a leading `\`. `None` when the path ends at the
+    /// partition, which boots its removable-media loader.
+    fn loader_path(&self) -> Option<String> {
+        let nodes = device_path_nodes(&self.device_path);
+        let after_hd = nodes
+            .iter()
+            .position(|&(ty, sub, _)| ty == DP_MEDIA && sub == DP_MEDIA_HD)?
+            + 1;
+        let parts: Vec<String> = nodes[after_hd..]
+            .iter()
+            .take_while(|&&(ty, sub, _)| ty == DP_MEDIA && sub == DP_MEDIA_FILE)
+            .map(|&(_, _, data)| ucs2_until_nul(data))
+            .collect();
+        if parts.is_empty() {
+            return None;
+        }
+        let mut path = String::new();
+        for part in parts.iter().flat_map(|p| p.split(['\\', '/'])) {
+            if !part.is_empty() {
+                path.push('\\');
+                path.push_str(part);
+            }
+        }
+        Some(path)
     }
 }
 
@@ -183,27 +294,10 @@ fn mount_efivarfs() -> Result<(), EfiBootError> {
     }
 }
 
-/// The reuse-or-create + reorder logic over any [`VarStore`].
+/// The reuse / replace / create + reorder logic over any [`VarStore`].
 fn ensure_in(store: &impl VarStore, gpt: &GptEsp) -> Result<BootEntry, EfiBootError> {
     let (entries, used) = read_boot_entries(store)?;
-
-    let (number, created) = match pick_existing(&entries, &gpt.unique_guid) {
-        Some(n) => (n, false),
-        None => {
-            let n = free_boot_number(&used).ok_or(EfiBootError::NoFreeEntry)?;
-            let dp = hd_file_device_path(gpt, ESP_LOADER_PATH);
-            let name = boot_var_name(n);
-            store
-                .write(
-                    &name,
-                    &encode_load_option(LOAD_OPTION_ACTIVE, DESCRIPTION, &dp),
-                )
-                .map_err(|source| EfiBootError::WriteVar { name, source })?;
-            (n, true)
-        }
-    };
-
-    let order = match store
+    let previous_order = match store
         .read("BootOrder")
         .map_err(|source| EfiBootError::ReadVar {
             name: "BootOrder".into(),
@@ -212,13 +306,37 @@ fn ensure_in(store: &impl VarStore, gpt: &GptEsp) -> Result<BootEntry, EfiBootEr
         Some(raw) => parse_boot_order(&raw).ok_or(EfiBootError::BadBootOrder)?,
         None => Vec::new(),
     };
-    let network: Vec<u16> = entries
-        .iter()
-        .filter(|(_, opt)| is_network(&opt.device_path))
-        .map(|(n, _)| *n)
-        .collect();
-    let boot_order = place_after_network(&order, number, |n| network.contains(&n));
-    if boot_order != order {
+
+    let (number, outcome) = match pick_existing(&entries, gpt, ESP_LOADER_PATH) {
+        Some(n) => (n, Outcome::Reused),
+        None => {
+            let (n, outcome) = match previous_entry(&entries) {
+                Some(n) => (n, Outcome::Replaced),
+                None => (
+                    free_boot_number(&used).ok_or(EfiBootError::NoFreeEntry)?,
+                    Outcome::Created,
+                ),
+            };
+            let dp = hd_file_device_path(gpt, ESP_LOADER_PATH);
+            let name = boot_var_name(n);
+            store
+                .write(
+                    &name,
+                    &encode_load_option(LOAD_OPTION_ACTIVE, DESCRIPTION, &dp),
+                )
+                .map_err(|source| EfiBootError::WriteVar { name, source })?;
+            (n, outcome)
+        }
+    };
+
+    let option = |n: u16| entries.iter().find(|(m, _)| *m == n).map(|(_, o)| o);
+    let boot_order = place_after_network(
+        &previous_order,
+        number,
+        |n| option(n).is_some_and(LoadOption::is_auto_bootable),
+        |n| option(n).is_some_and(|o| is_network(&o.device_path)),
+    );
+    if boot_order != previous_order {
         store
             .write("BootOrder", &encode_boot_order(&boot_order))
             .map_err(|source| EfiBootError::WriteVar {
@@ -229,7 +347,8 @@ fn ensure_in(store: &impl VarStore, gpt: &GptEsp) -> Result<BootEntry, EfiBootEr
 
     Ok(BootEntry {
         number,
-        created,
+        outcome,
+        previous_order,
         boot_order,
     })
 }
@@ -275,12 +394,28 @@ fn parse_boot_var_name(name: &str) -> Option<u16> {
     u16::from_str_radix(hex, 16).ok()
 }
 
-/// The lowest-numbered **active** entry whose device path names the partition
-/// `guid` — the one to reuse.
-fn pick_existing(entries: &[(u16, LoadOption)], guid: &[u8; 16]) -> Option<u16> {
+/// The lowest-numbered **active** entry that starts `loader` on exactly the
+/// partition `gpt` describes (see the module docs) — the one to reuse.
+fn pick_existing(entries: &[(u16, LoadOption)], gpt: &GptEsp, loader: &str) -> Option<u16> {
     entries
         .iter()
-        .filter(|(_, opt)| opt.is_active() && references_partition(&opt.device_path, guid))
+        .filter(|(_, opt)| {
+            opt.is_active()
+                && opt.hd().is_some_and(|hd| hd.is(gpt))
+                && opt
+                    .loader_path()
+                    .is_none_or(|p| p.eq_ignore_ascii_case(loader))
+        })
+        .map(|(n, _)| *n)
+        .min()
+}
+
+/// The lowest-numbered entry described [`DESCRIPTION`]: the one a previous deploy
+/// wrote, to overwrite rather than allocate another number.
+fn previous_entry(entries: &[(u16, LoadOption)]) -> Option<u16> {
+    entries
+        .iter()
+        .filter(|(_, opt)| opt.description == DESCRIPTION)
         .map(|(n, _)| *n)
         .min()
 }
@@ -290,11 +425,26 @@ fn free_boot_number(used: &[u16]) -> Option<u16> {
     (0..=u16::MAX).find(|n| !used.contains(n))
 }
 
-/// `order` with `n` moved to right after its last network entry (`is_net`), or to
-/// the front if it has none.
-fn place_after_network(order: &[u16], n: u16, is_net: impl Fn(u16) -> bool) -> Vec<u16> {
+/// `order` with `n` moved to right after the network entries that lead it. Only
+/// entries the firmware would boot on its own (`bootable`) count: the disk goes
+/// right before the first bootable entry that isn't network (`is_net`), or right
+/// after the last bootable network entry when none follows. Every other entry
+/// keeps its place.
+fn place_after_network(
+    order: &[u16],
+    n: u16,
+    bootable: impl Fn(u16) -> bool,
+    is_net: impl Fn(u16) -> bool,
+) -> Vec<u16> {
     let mut out: Vec<u16> = order.iter().copied().filter(|&e| e != n).collect();
-    let at = out.iter().rposition(|&e| is_net(e)).map_or(0, |i| i + 1);
+    let first_other = out
+        .iter()
+        .position(|&e| bootable(e) && !is_net(e))
+        .unwrap_or(out.len());
+    let at = out[..first_other]
+        .iter()
+        .rposition(|&e| bootable(e) && is_net(e))
+        .map_or(first_other, |i| i + 1);
     out.insert(at, n);
     out
 }
@@ -313,6 +463,16 @@ fn parse_boot_order(raw: &[u8]) -> Option<Vec<u16>> {
 
 fn encode_boot_order(order: &[u16]) -> Vec<u8> {
     order.iter().flat_map(|n| n.to_le_bytes()).collect()
+}
+
+/// UCS-2 (little-endian) `data` up to its first NUL.
+fn ucs2_until_nul(data: &[u8]) -> String {
+    let units: Vec<u16> = data
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|&u| u != 0)
+        .collect();
+    String::from_utf16_lossy(&units)
 }
 
 /// `s` as NUL-terminated UCS-2 (little-endian).
@@ -393,19 +553,6 @@ fn device_path_nodes(dp: &[u8]) -> Vec<(u8, u8, &[u8])> {
         rest = &rest[len..];
     }
     nodes
-}
-
-/// Whether `dp` has a GPT `HD()` node whose signature is the partition `guid`.
-fn references_partition(dp: &[u8], guid: &[u8; 16]) -> bool {
-    device_path_nodes(dp).iter().any(|&(ty, sub, data)| {
-        // data: number 0..4, start 4..12, size 12..20, signature 20..36,
-        // MBR type 36, signature type 37.
-        ty == DP_MEDIA
-            && sub == DP_MEDIA_HD
-            && data.len() >= 38
-            && data[37] == HD_GPT
-            && data[20..36] == guid[..]
-    })
 }
 
 /// Whether `dp` is a network boot path (it has a MAC, IPv4, IPv6 or URI node).
@@ -632,15 +779,135 @@ mod tests {
         }
     }
 
+    /// `HD(<gpt>)` followed by one `File()` node per entry of `files` (none: an
+    /// HD-only path), after an optional `prefix` of hardware nodes.
+    fn hd_path(prefix: &[u8], gpt: &GptEsp, files: &[&str]) -> Vec<u8> {
+        let full = hd_file_device_path(gpt, "x");
+        let mut dp = prefix.to_vec();
+        dp.extend(&full[..HD_NODE_LEN as usize]);
+        for f in files {
+            let path = ucs2_nul(f);
+            dp.extend([DP_MEDIA, DP_MEDIA_FILE]);
+            dp.extend((4 + path.len() as u16).to_le_bytes());
+            dp.extend(path);
+        }
+        dp.extend([DP_END, DP_END_ENTIRE, 4, 0]);
+        dp
+    }
+
+    /// `PciRoot(0)/Pci(4,0)`: the hardware prefix of a firmware's full-path entry.
+    const PCI_PREFIX: [u8; 18] = [
+        0x02, 0x01, 12, 0, 0x41, 0xD0, 0x0A, 0x03, 0, 0, 0, 0, 0x01, 0x01, 6, 0, 0, 4,
+    ];
+
+    /// An `Fv(..)/FvFile(..)` path, the shape of firmware-internal apps (setup,
+    /// boot menu, shell).
+    fn fv_path() -> Vec<u8> {
+        let mut dp = vec![0x04, 0x07, 20, 0];
+        dp.extend([0u8; 16]);
+        dp.extend([0x04, 0x06, 20, 0]);
+        dp.extend([1u8; 16]);
+        dp.extend([DP_END, DP_END_ENTIRE, 4, 0]);
+        dp
+    }
+
+    /// The removable-media loader of the architecture this build does NOT target.
+    fn other_arch_loader() -> &'static str {
+        if ESP_LOADER_PATH.ends_with("BOOTX64.EFI") {
+            r"\EFI\BOOT\BOOTAA64.EFI"
+        } else {
+            r"\EFI\BOOT\BOOTX64.EFI"
+        }
+    }
+
+    const APP: u32 = LOAD_OPTION_ACTIVE | 0x100;
+
+    fn parsed(attrs: u32, desc: &str, dp: &[u8]) -> LoadOption {
+        parse_load_option(&option(attrs, desc, dp)).unwrap()
+    }
+
     #[test]
     fn recognises_network_and_partition_paths() {
         assert!(is_network(&pxe_path()));
         assert!(!is_network(&disk_path()));
-        let hd = hd_file_device_path(&esp(), ESP_LOADER_PATH);
-        assert!(!is_network(&hd));
-        assert!(references_partition(&hd, &GUID));
-        assert!(!references_partition(&hd, &[0u8; 16]));
-        assert!(!references_partition(&pxe_path(), &GUID));
+        let hd = parsed(1, "x", &hd_file_device_path(&esp(), ESP_LOADER_PATH));
+        assert!(!is_network(&hd.device_path));
+        assert_eq!(
+            hd.hd(),
+            Some(HdNode {
+                number: 1,
+                start: 2048,
+                size: 1024,
+                guid: GUID,
+            })
+        );
+        assert!(hd.hd().unwrap().is(&esp()));
+        assert_eq!(parsed(1, "pxe", &pxe_path()).hd(), None);
+    }
+
+    #[test]
+    fn hd_node_must_match_the_whole_gpt_entry() {
+        let hd = parsed(1, "x", &hd_file_device_path(&esp(), ESP_LOADER_PATH))
+            .hd()
+            .unwrap();
+        let moved = GptEsp {
+            first_lba: 4096,
+            last_lba: 4096 + 1023,
+            ..esp()
+        };
+        let resized = GptEsp {
+            last_lba: 2048 + 2047,
+            ..esp()
+        };
+        let renumbered = GptEsp { number: 2, ..esp() };
+        let other_guid = GptEsp {
+            unique_guid: [0xAA; 16],
+            ..esp()
+        };
+        for gpt in [moved, resized, renumbered, other_guid] {
+            assert!(!hd.is(&gpt), "{gpt:?}");
+        }
+    }
+
+    #[test]
+    fn loader_path_joins_and_normalizes_file_nodes() {
+        let path = |files: &[&str]| parsed(1, "x", &hd_path(&[], &esp(), files)).loader_path();
+        assert_eq!(
+            path(&[r"\EFI\BOOT\BOOTX64.EFI"]).as_deref(),
+            Some(r"\EFI\BOOT\BOOTX64.EFI")
+        );
+        // A path split across File() nodes, with and without separators.
+        assert_eq!(
+            path(&[r"\EFI", r"BOOT\BOOTX64.EFI"]).as_deref(),
+            Some(r"\EFI\BOOT\BOOTX64.EFI")
+        );
+        assert_eq!(
+            path(&[r"\EFI\", r"\BOOT\", "BOOTX64.EFI"]).as_deref(),
+            Some(r"\EFI\BOOT\BOOTX64.EFI")
+        );
+        // Forward slashes and doubled separators are normalized.
+        assert_eq!(
+            path(&["EFI//BOOT/BOOTX64.EFI"]).as_deref(),
+            Some(r"\EFI\BOOT\BOOTX64.EFI")
+        );
+        // A path ending at the partition boots its removable-media loader.
+        assert_eq!(path(&[]), None);
+        // A firmware's full path: the hardware prefix doesn't matter.
+        let full = parsed(1, "fw", &hd_path(&PCI_PREFIX, &esp(), &[ESP_LOADER_PATH]));
+        assert_eq!(full.loader_path().as_deref(), Some(ESP_LOADER_PATH));
+        assert!(full.hd().unwrap().is(&esp()));
+    }
+
+    #[test]
+    fn only_active_boot_category_entries_are_auto_bootable() {
+        let dp = disk_path();
+        assert!(parsed(LOAD_OPTION_ACTIVE, "x", &dp).is_auto_bootable());
+        // LOAD_OPTION_HIDDEN only hides the entry from the menu.
+        assert!(parsed(LOAD_OPTION_ACTIVE | 0x8, "x", &dp).is_auto_bootable());
+        assert!(!parsed(0, "x", &dp).is_auto_bootable(), "inactive");
+        assert!(!parsed(APP, "x", &dp).is_auto_bootable(), "CATEGORY_APP");
+        // OVMF's BootManagerMenuApp: ACTIVE | HIDDEN | CATEGORY_APP.
+        assert!(!parsed(0x109, "x", &dp).is_auto_bootable());
     }
 
     #[test]
@@ -666,33 +933,97 @@ mod tests {
         }
     }
 
-    #[test]
-    fn place_after_network_cases() {
-        let net = |n: u16| n == 1 || n == 2;
-        // No network entries: first.
-        assert_eq!(place_after_network(&[5, 6], 9, |_| false), vec![9, 5, 6]);
-        // Empty order.
-        assert_eq!(place_after_network(&[], 9, net), vec![9]);
-        // Leading network entries.
-        assert_eq!(place_after_network(&[1, 2, 5], 9, net), vec![1, 2, 9, 5]);
-        // Scattered: after the LAST network entry.
-        assert_eq!(
-            place_after_network(&[1, 5, 2, 6], 9, net),
-            vec![1, 5, 2, 9, 6]
-        );
-        // Already present elsewhere: moved, not duplicated.
-        assert_eq!(place_after_network(&[9, 1, 5], 9, net), vec![1, 9, 5]);
-        // Already in place: unchanged.
-        assert_eq!(place_after_network(&[1, 9, 5], 9, net), vec![1, 9, 5]);
+    /// Placement over a described order: 1, 2 = network; 5, 6 = disks; 3 = a
+    /// BOOT-category shell; 0, 7, 8 = APP entries (menu, setup, shell); 4 = an
+    /// inactive network entry; 42 has no Boot#### at all.
+    fn place(order: &[u16]) -> Vec<u16> {
+        let bootable = |n: u16| matches!(n, 1 | 2 | 3 | 5 | 6);
+        let net = |n: u16| matches!(n, 1 | 2 | 4);
+        place_after_network(order, 9, bootable, net)
     }
 
     #[test]
-    fn pick_existing_skips_inactive_entries() {
+    fn placement_goes_after_the_leading_network_entries() {
+        // Network first: the disk follows the leading network run.
+        assert_eq!(place(&[1, 2, 5]), vec![1, 2, 9, 5]);
+        // The reviewer's cases: a BOOT-category shell or an old OS disk ahead of
+        // PXE puts the disk first, so neither the shell nor the old disk wins.
+        assert_eq!(place(&[3, 1]), vec![9, 3, 1]);
+        assert_eq!(place(&[5, 1, 3]), vec![9, 5, 1, 3]);
+        // A network entry further down doesn't pull the disk below other disks.
+        assert_eq!(place(&[1, 5, 2, 6]), vec![1, 9, 5, 2, 6]);
+        // No network entries at all.
+        assert_eq!(place(&[5, 6]), vec![9, 5, 6]);
+        assert_eq!(place(&[]), vec![9]);
+    }
+
+    #[test]
+    fn placement_skips_entries_the_firmware_never_boots_on_its_own() {
+        // OVMF: [Menu(app), Setup(app), PXE, HTTP, Shell(app)]. The app entries
+        // keep their places; the disk goes after HTTP, not to index 0 ahead of PXE.
+        assert_eq!(place(&[0, 7, 1, 2, 8]), vec![0, 7, 1, 2, 9, 8]);
+        // OVMF with its whole-disk entry ahead of PXE: the disk goes before it.
+        assert_eq!(place(&[0, 7, 5, 1]), vec![0, 7, 9, 5, 1]);
+        // A dangling number and an inactive PXE entry don't count.
+        assert_eq!(place(&[42, 4, 1, 5]), vec![42, 4, 1, 9, 5]);
+        assert_eq!(place(&[4, 5, 1]), vec![4, 9, 5, 1]);
+        // Only non-bootable entries: after them.
+        assert_eq!(place(&[0, 7]), vec![0, 7, 9]);
+    }
+
+    #[test]
+    fn placement_moves_an_entry_already_in_the_order() {
+        assert_eq!(place(&[9, 1, 5]), vec![1, 9, 5]);
+        assert_eq!(place(&[1, 9, 5]), vec![1, 9, 5], "already in place");
+        assert_eq!(place(&[1, 5, 9]), vec![1, 9, 5]);
+    }
+
+    #[test]
+    fn pick_existing_reuses_only_an_entry_starting_our_loader() {
+        let gpt = esp();
+        let reusable =
+            |dp: Vec<u8>| pick_existing(&[(4, parsed(1, "x", &dp))], &gpt, ESP_LOADER_PATH);
+        // Our loader, short-form or a firmware's full path.
+        assert_eq!(reusable(hd_path(&[], &gpt, &[ESP_LOADER_PATH])), Some(4));
+        assert_eq!(
+            reusable(hd_path(&PCI_PREFIX, &gpt, &[ESP_LOADER_PATH])),
+            Some(4)
+        );
+        // FAT is case-insensitive.
+        let lower = ESP_LOADER_PATH.to_lowercase();
+        assert_eq!(reusable(hd_path(&[], &gpt, &[&lower])), Some(4));
+        // Split across File() nodes.
+        let (dir, file) = ESP_LOADER_PATH.rsplit_once('\\').unwrap();
+        assert_eq!(reusable(hd_path(&[], &gpt, &[dir, file])), Some(4));
+        // A path ending at the partition boots the same removable-media loader.
+        assert_eq!(reusable(hd_path(&[], &gpt, &[])), Some(4));
+        // Another file on the same partition GUID: an earlier image's loader, a
+        // distro loader, or the other architecture's fallback.
+        for other in [
+            r"\EFI\oldos\grubx64.efi",
+            r"\EFI\ubuntu\shimx64.efi",
+            other_arch_loader(),
+        ] {
+            assert_eq!(reusable(hd_path(&[], &gpt, &[other])), None, "{other}");
+        }
+        // Our loader on a partition with another layout.
+        let resized = GptEsp {
+            last_lba: 2048 + 4095,
+            ..esp()
+        };
+        assert_eq!(reusable(hd_path(&[], &resized, &[ESP_LOADER_PATH])), None);
+    }
+
+    #[test]
+    fn pick_existing_skips_inactive_entries_and_takes_the_lowest() {
         let hd = hd_file_device_path(&esp(), ESP_LOADER_PATH);
-        let opt = |attrs| parse_load_option(&option(attrs, "x", &hd)).unwrap();
-        let entries = vec![(3, opt(0)), (7, opt(LOAD_OPTION_ACTIVE)), (8, opt(1))];
-        assert_eq!(pick_existing(&entries, &GUID), Some(7));
-        assert_eq!(pick_existing(&entries[..1], &GUID), None);
+        let entries = vec![
+            (3, parsed(0, "x", &hd)),
+            (7, parsed(LOAD_OPTION_ACTIVE, "x", &hd)),
+            (8, parsed(1, "x", &hd)),
+        ];
+        assert_eq!(pick_existing(&entries, &esp(), ESP_LOADER_PATH), Some(7));
+        assert_eq!(pick_existing(&entries[..1], &esp(), ESP_LOADER_PATH), None);
     }
 
     #[test]
@@ -716,42 +1047,129 @@ mod tests {
             got,
             BootEntry {
                 number: 2,
-                created: true,
+                outcome: Outcome::Created,
+                previous_order: vec![0, 1],
                 boot_order: vec![0, 2, 1],
             }
         );
         let opt = parse_load_option(&vars.get("Boot0002").unwrap()).unwrap();
-        assert!(opt.is_active());
+        assert!(opt.is_auto_bootable());
         assert_eq!(opt.description, "beskar7");
-        assert!(references_partition(&opt.device_path, &GUID));
+        assert!(opt.hd().unwrap().is(&esp()));
+        assert_eq!(opt.loader_path().as_deref(), Some(ESP_LOADER_PATH));
         assert_eq!(vars.get("BootOrder").unwrap(), order(&[0, 2, 1]));
     }
 
     #[test]
-    fn reuses_the_firmware_entry_for_the_partition() {
-        let fw = hd_file_device_path(&esp(), r"\EFI\ubuntu\shimx64.efi");
+    fn ovmf_boot_order_places_the_disk_after_its_network_entries() {
+        // The NVRAM an OVMF host has before provisioning (e2e seed-nodisk).
+        let vars = MemVars::with(&[
+            ("Boot0000", option(0x109, "BootManagerMenuApp", &fv_path())),
+            ("Boot0001", option(APP, "EFI Firmware Setup", &fv_path())),
+            ("Boot0002", option(1, "UEFI PXEv4", &pxe_path())),
+            ("Boot0003", option(1, "UEFI HTTPv4", &pxe_path())),
+            ("Boot0004", option(APP, "EFI Internal Shell", &fv_path())),
+            ("BootOrder", order(&[0, 1, 2, 3, 4])),
+        ]);
+        let got = ensure_in(&vars, &esp()).unwrap();
+        assert_eq!(got.number, 5);
+        assert_eq!(got.boot_order, vec![0, 1, 2, 3, 5, 4]);
+    }
+
+    #[test]
+    fn reuses_the_firmware_entry_that_starts_our_loader() {
+        let fw = hd_path(&PCI_PREFIX, &esp(), &[ESP_LOADER_PATH]);
         let vars = MemVars::with(&[
             ("Boot0000", option(1, "UEFI PXEv4", &pxe_path())),
-            ("Boot0004", option(1, "ubuntu", &fw)),
+            ("Boot0004", option(1, "UEFI HARDDISK", &fw)),
             ("BootOrder", order(&[4, 0])),
         ]);
         let got = ensure_in(&vars, &esp()).unwrap();
-        assert_eq!((got.number, got.created), (4, false));
+        assert_eq!((got.number, got.outcome), (4, Outcome::Reused));
         assert_eq!(got.boot_order, vec![0, 4]);
         assert_eq!(*vars.writes.borrow(), vec!["BootOrder".to_string()]);
     }
 
     #[test]
-    fn a_second_run_changes_nothing() {
+    fn does_not_reuse_an_entry_starting_another_loader() {
+        // Same partition GUID (images built from the same base share it), but the
+        // entry starts a file the new image may not have.
+        for (desc, file) in [
+            ("oldos", r"\EFI\oldos\grubx64.efi"),
+            ("ubuntu", r"\EFI\ubuntu\shimx64.efi"),
+        ] {
+            let stale = option(1, desc, &hd_path(&[], &esp(), &[file]));
+            let vars = MemVars::with(&[
+                ("Boot0000", option(1, "UEFI PXEv4", &pxe_path())),
+                ("Boot0004", stale.clone()),
+                ("BootOrder", order(&[0, 4])),
+            ]);
+            let got = ensure_in(&vars, &esp()).unwrap();
+            assert_eq!((got.number, got.outcome), (1, Outcome::Created), "{file}");
+            assert_eq!(got.boot_order, vec![0, 1, 4]);
+            assert_eq!(vars.get("Boot0004").unwrap(), stale, "left untouched");
+        }
+    }
+
+    #[test]
+    fn replaces_the_previous_beskar7_entry_in_place() {
+        // A previous deploy of an image with another ESP GUID left Boot0003.
+        let old_gpt = GptEsp {
+            unique_guid: [0x55; 16],
+            ..esp()
+        };
+        let old = hd_file_device_path(&old_gpt, ESP_LOADER_PATH);
+        let vars = MemVars::with(&[
+            ("Boot0000", option(1, "UEFI PXEv4", &pxe_path())),
+            ("Boot0001", option(1, "UEFI NVMe", &disk_path())),
+            ("Boot0003", option(1, DESCRIPTION, &old)),
+            ("BootOrder", order(&[0, 3, 1])),
+        ]);
+        let got = ensure_in(&vars, &esp()).unwrap();
+        assert_eq!((got.number, got.outcome), (3, Outcome::Replaced));
+        assert_eq!(got.boot_order, vec![0, 3, 1], "keeps its slot");
+        assert_eq!(
+            *vars.writes.borrow(),
+            vec!["Boot0003".to_string()],
+            "no new number, no BootOrder write"
+        );
+        let opt = parse_load_option(&vars.get("Boot0003").unwrap()).unwrap();
+        assert!(opt.hd().unwrap().is(&esp()), "now points at the new ESP");
+    }
+
+    #[test]
+    fn replaces_the_lowest_of_several_beskar7_entries() {
+        let old = |g: u8| {
+            let gpt = GptEsp {
+                unique_guid: [g; 16],
+                ..esp()
+            };
+            option(1, DESCRIPTION, &hd_file_device_path(&gpt, ESP_LOADER_PATH))
+        };
+        let vars = MemVars::with(&[
+            ("Boot0006", old(0x66)),
+            ("Boot0002", old(0x22)),
+            ("BootOrder", order(&[6, 2])),
+        ]);
+        let got = ensure_in(&vars, &esp()).unwrap();
+        assert_eq!((got.number, got.outcome), (2, Outcome::Replaced));
+    }
+
+    #[test]
+    fn a_matching_beskar7_entry_is_reused_not_replaced() {
         let vars = MemVars::with(&[
             ("Boot0000", option(1, "UEFI PXEv4", &pxe_path())),
             ("BootOrder", order(&[0])),
         ]);
         let first = ensure_in(&vars, &esp()).unwrap();
-        assert!(first.created);
+        assert_eq!(first.outcome, Outcome::Created);
         vars.writes.borrow_mut().clear();
         let second = ensure_in(&vars, &esp()).unwrap();
-        assert_eq!((second.number, second.created), (first.number, false));
+        assert_eq!(
+            (second.number, second.outcome),
+            (first.number, Outcome::Reused)
+        );
+        assert_eq!(second.previous_order, first.boot_order);
         assert!(vars.writes.borrow().is_empty(), "no NVRAM write on a rerun");
     }
 
@@ -759,6 +1177,7 @@ mod tests {
     fn a_missing_boot_order_is_created() {
         let vars = MemVars::default();
         let got = ensure_in(&vars, &esp()).unwrap();
+        assert_eq!(got.previous_order, Vec::<u16>::new());
         assert_eq!(got.boot_order, vec![0]);
         assert_eq!(vars.get("BootOrder").unwrap(), order(&[0]));
     }
@@ -774,14 +1193,15 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_boot_order_is_fatal() {
+    fn a_malformed_boot_order_is_an_error_and_nothing_is_written() {
         let vars = MemVars::with(&[("BootOrder", vec![0, 0, 1])]);
         let err = ensure_in(&vars, &esp()).unwrap_err();
         assert!(matches!(err, EfiBootError::BadBootOrder), "got {err:?}");
+        assert!(vars.writes.borrow().is_empty());
     }
 
     #[test]
-    fn a_failed_entry_write_is_fatal_and_leaves_boot_order_alone() {
+    fn a_refused_entry_write_is_an_error_and_leaves_boot_order_alone() {
         let vars = MemVars {
             fail_write: Some("Boot0001"),
             ..MemVars::with(&[
@@ -798,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_boot_order_write_is_fatal() {
+    fn a_refused_boot_order_write_is_an_error() {
         let vars = MemVars {
             fail_write: Some("BootOrder"),
             ..MemVars::default()
