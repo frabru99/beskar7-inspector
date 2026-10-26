@@ -76,15 +76,29 @@ parameters on the kernel cmdline. The inspector then runs two phases:
    verified TLS (success is `202 Accepted`). `--dry-run` stops here.
 2. **Provision** (when bootstrap data is ready) — `GET` the CAPI bootstrap
    user-data, stream the digest-pinned whole-disk OS image (a Kairos raw image)
-   onto the selected disk while verifying its SHA-256, inject a per-host
-   cloud-config (carrying the join secret) into the image's `COS_OEM` partition,
-   and `reboot(2)` into the provisioned OS.
+   onto the selected disk while verifying its SHA-256, register a UEFI boot
+   entry for the image's ESP loader, inject a per-host cloud-config (carrying
+   the join secret) into the image's `COS_OEM` partition, and `reboot(2)` into
+   the provisioned OS.
+
+   The boot entry starts the removable-media loader for the inspector's
+   architecture, `\EFI\BOOT\BOOTX64.EFI` on x86_64 and `\EFI\BOOT\BOOTAA64.EFI`
+   on aarch64; an image whose ESP lacks it fails the deploy. An existing entry
+   that already starts that loader on that partition is reused; otherwise the
+   previous `beskar7` entry is overwritten, or a new one created. It goes in
+   `BootOrder` right after the network entries that lead it (counting only
+   entries the firmware boots on its own), or first when the boot order doesn't
+   start with network. A firmware that refuses the NVRAM write (boot order locked
+   in setup, NVRAM full) is logged and left to find the loader itself; legacy
+   BIOS boots and images without an ESP skip the step. Another disk carrying a
+   partition with the same GUID is logged, since the firmware may boot either.
 
 ```
 power on → PXE → controller-rendered iPXE → inspector
               Phase 1: probe → POST report (202)
               Phase 2: GET bootstrap → write image (digest-verified)
-                       → inject COS_OEM config → reboot → target OS
+                       → UEFI boot entry for the ESP → inject COS_OEM config
+                       → reboot → target OS
 ```
 
 The wire contract — endpoints, cmdline parameters, the report schema, the
@@ -114,6 +128,8 @@ hardware is absent binds nothing.
 | | Marvell/QLogic FastLinQ, Emulex OneConnect, Marvell/Aquantia AQtion, AMD/Solarflare, Chelsio T4–T6, Cisco UCS VIC | `qede`, `be2net`, `atlantic`, `sfc`, `cxgb4`, `enic` |
 | | Virtual: virtio, VMware vmxnet3 | `virtio_net`, `vmxnet3` |
 | Filesystem | ext4 (for the image's `COS_OEM` partition) | `ext4` |
+| | FAT (for the image's ESP, mounted read-only to check its loader) | `vfat`, `nls_cp437`, `nls_ascii` |
+| | efivarfs (for the disk's UEFI boot entry) | `efivarfs` |
 
 Drivers that need device firmware get it from the image. At build time, every
 firmware file the shipped modules declare is copied into `/lib/firmware`, where
@@ -199,8 +215,10 @@ src/report.rs       serde structs that serialize to the contract report schema
 src/client.rs       rustls callback client: POST report (202), GET bootstrap
 src/image.rs        digest-pinned streaming target-image fetch
 src/target_disk.rs  target-disk selection
+src/esp.rs          locate the EFI System Partition (GPT type GUID) on the target disk
+src/efiboot.rs      register the disk's UEFI boot entry over efivarfs (native efibootmgr)
 src/oem.rs          locate the COS_OEM partition on the target disk
-src/deploy.rs       whole-disk write + COS_OEM mount/inject + reboot
+src/deploy.rs       whole-disk write + ESP loader check + COS_OEM mount/inject + reboot
 src/run.rs          the PID-1 two-phase pipeline
 src/main.rs         thin PID-1 entrypoint over run::run
 tests/contract.rs   golden-fixture report round-trip (shared with beskar7)
