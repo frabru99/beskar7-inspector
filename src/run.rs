@@ -377,6 +377,10 @@ fn esp_prepared_line(prepared: &deploy::EspPrepared, esp: &EspPartition) -> Stri
             "ESP {dev} prepared: marker {marker}; the image's own {path} left in place, \
              no startup.nsh fallback written"
         ),
+        deploy::StartupNsh::NotWritten(cause) => format!(
+            "warning: ESP {dev}: startup.nsh fallback not written ({cause}); the deploy \
+             carries on without it"
+        ),
     }
 }
 
@@ -1128,6 +1132,16 @@ mod tests {
                 &located_esp()
             ),
             r"ESP /dev/sda1 prepared: marker 0123456789abcdef; the image's own \startup.nsh left in place, no startup.nsh fallback written"
+        );
+        let skipped = esp_prepared_line(
+            &prepared(deploy::StartupNsh::NotWritten(
+                "No space left on device (os error 28)".into(),
+            )),
+            &located_esp(),
+        );
+        assert_eq!(
+            skipped,
+            "warning: ESP /dev/sda1: startup.nsh fallback not written (No space left on device (os error 28)); the deploy carries on without it"
         );
     }
 

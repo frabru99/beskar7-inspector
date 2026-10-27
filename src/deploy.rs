@@ -26,14 +26,16 @@
 //! `COS_OEM` writes happen after verification and do not affect it.
 //!
 //! ## The `startup.nsh` fallback
-//! Some firmware (AMI Aptio) rebuilds `BootOrder` from its own setup priorities at
+//! Some AMI Aptio versions rebuild `BootOrder` from their own setup priorities at
 //! every POST, dropping the entry the inspector writes, and with the built-in EFI
 //! Shell first it ends every boot in the Shell, which runs the first `startup.nsh`
 //! it finds on a mapped filesystem. [`prepare_esp`] writes a random per-deploy
 //! marker `\EFI\beskar7\<marker>.id` and, when the image has no `startup.nsh` of
 //! its own, one at the ESP root: it looks for the marker on `FS0:`–`FS31:` and
 //! starts [`ESP_LOADER_PATH`] there, or says so and stops at the Shell prompt. An
-//! image's own `startup.nsh` is left in place.
+//! image's own `startup.nsh` is left in place. The fallback is optional: a full or
+//! read-only ESP (`ENOSPC`, `EROFS`) skips it with a warning, like a refused NVRAM
+//! write; any other write error still fails the deploy.
 //!
 //! ## Identity, never a re-resolvable path (TOCTOU guard, §5 / §9.1 5.3)
 //! Neither destructive operation trusts a `/dev/<kname>` path it could re-resolve
@@ -497,6 +499,9 @@ pub enum StartupNsh {
     Written,
     /// The image ships its own (at this UEFI path); it was left in place.
     LeftInPlace(String),
+    /// The ESP is full or read-only (the error says which): the fallback was
+    /// skipped, and any half-written script of ours removed.
+    NotWritten(String),
 }
 
 /// Mount the located ESP, check its [`ESP_LOADER_PATH`] loader is a regular file
@@ -506,8 +511,9 @@ pub enum StartupNsh {
 ///
 /// The mount is bound to the ESP's enumerated `major:minor` exactly as for
 /// `COS_OEM` (see [`inject_oem_config`]), and the ESP is **always unmounted before
-/// returning**. Every failure is a hard failure: a missing loader means the image
-/// cannot boot under UEFI, and an I/O error on a located ESP points at a bad disk.
+/// returning**. A missing loader (the image cannot boot under UEFI) and an I/O
+/// error on the located ESP (a bad disk) are hard failures; a full or read-only
+/// ESP only skips the optional fallback ([`StartupNsh::NotWritten`]).
 pub fn prepare_esp(esp: &EspPartition) -> Result<EspPrepared, DeployError> {
     let marker = new_marker().map_err(DeployError::EspWrite)?;
     let mut startup_nsh = None;
@@ -802,47 +808,81 @@ fn render_startup_nsh(marker: &str) -> String {
 /// An image's own script is never touched. Pure file I/O over an injected
 /// directory, so it is unit-tested against a scratch dir without a mount.
 fn write_esp_fallback(mount_dir: &Path, marker: &str) -> Result<StartupNsh, DeployError> {
-    let io = DeployError::EspWrite;
-    let efi_dir = match child(mount_dir, "EFI").map_err(io)? {
+    fallback_outcome(write_esp_files(mount_dir, marker))
+}
+
+/// Map the fallback's write result: a full or read-only ESP only skips the
+/// optional fallback ([`StartupNsh::NotWritten`]); any other I/O error (an `EIO`
+/// from a bad disk, say) fails the deploy as [`EspWrite`](DeployError::EspWrite).
+fn fallback_outcome(result: std::io::Result<StartupNsh>) -> Result<StartupNsh, DeployError> {
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(e) if is_full_or_read_only(&e) => Ok(StartupNsh::NotWritten(e.to_string())),
+        Err(e) => Err(DeployError::EspWrite(e)),
+    }
+}
+
+/// `ENOSPC` (the ESP is full) or `EROFS` (Linux remounted it read-only).
+fn is_full_or_read_only(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(nix::libc::ENOSPC) | Some(nix::libc::EROFS)
+    )
+}
+
+/// The file I/O of [`write_esp_fallback`]. A marker or script that fails half-way
+/// is removed (best-effort) before the error is returned, so the Shell never runs
+/// a truncated script; the script is only ever ours, since an existing one means
+/// it isn't written at all.
+fn write_esp_files(mount_dir: &Path, marker: &str) -> std::io::Result<StartupNsh> {
+    let efi_dir = match child(mount_dir, "EFI")? {
         Some((_, path)) => path,
         None => mount_dir.join("EFI"),
     };
     let marker_dir = efi_dir.join(MARKER_DIR);
-    fs::create_dir_all(&marker_dir).map_err(io)?;
-    for entry in fs::read_dir(&marker_dir).map_err(io)? {
-        let path = entry.map_err(io)?.path();
+    fs::create_dir_all(&marker_dir)?;
+    for entry in fs::read_dir(&marker_dir)? {
+        let path = entry?.path();
         if path
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("id"))
         {
-            fs::remove_file(&path).map_err(io)?;
+            fs::remove_file(&path)?;
         }
     }
-    write_synced(
+    write_synced_or_remove(
         &marker_dir.join(format!("{marker}.id")),
         b"beskar7 deploy marker\r\n",
-    )
-    .map_err(io)?;
+    )?;
 
     let mut outcome = StartupNsh::Written;
     for dir in STARTUP_NSH_DIRS {
         let parts: Vec<&str> = dir.iter().copied().chain([STARTUP_NSH_FILENAME]).collect();
-        if let Some(existing) = resolve_file(mount_dir, &parts).map_err(io)? {
+        if let Some(existing) = resolve_file(mount_dir, &parts)? {
             outcome = StartupNsh::LeftInPlace(existing);
             break;
         }
     }
+    let script = mount_dir.join(STARTUP_NSH_FILENAME);
     if outcome == StartupNsh::Written {
-        write_synced(
-            &mount_dir.join(STARTUP_NSH_FILENAME),
-            render_startup_nsh(marker).as_bytes(),
-        )
-        .map_err(io)?;
+        write_synced_or_remove(&script, render_startup_nsh(marker).as_bytes())?;
     }
     for dir in [&marker_dir, &efi_dir, &mount_dir.to_path_buf()] {
-        File::open(dir).and_then(|d| d.sync_all()).map_err(io)?;
+        if let Err(e) = File::open(dir).and_then(|d| d.sync_all()) {
+            if outcome == StartupNsh::Written {
+                let _ = fs::remove_file(&script);
+            }
+            return Err(e);
+        }
     }
     Ok(outcome)
+}
+
+/// [`write_synced`], removing the file again (best-effort) if it fails.
+fn write_synced_or_remove(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    write_synced(path, contents).inspect_err(|_| {
+        let _ = fs::remove_file(path);
+    })
 }
 
 /// The entry of `dir` named `name` ignoring ASCII case: its stored name and path.
@@ -1319,5 +1359,23 @@ mod tests {
         assert_eq!(a.len(), 16);
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_full_or_read_only_esp_skips_the_fallback_but_eio_fails() {
+        for errno in [nix::libc::ENOSPC, nix::libc::EROFS] {
+            let got = fallback_outcome(Err(std::io::Error::from_raw_os_error(errno))).unwrap();
+            assert!(
+                matches!(got, StartupNsh::NotWritten(_)),
+                "errno {errno}: {got:?}"
+            );
+        }
+        let err =
+            fallback_outcome(Err(std::io::Error::from_raw_os_error(nix::libc::EIO))).unwrap_err();
+        assert!(matches!(err, DeployError::EspWrite(_)), "got {err:?}");
+        assert_eq!(
+            fallback_outcome(Ok(StartupNsh::Written)).unwrap(),
+            StartupNsh::Written
+        );
     }
 }
