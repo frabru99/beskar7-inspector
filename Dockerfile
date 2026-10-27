@@ -15,7 +15,7 @@
 # manual digest bump (see .github/dependabot.yml). The tag was `rust:alpine`,
 # which floats across Rust releases as well as Alpine ones — naming the version
 # keeps a toolchain bump a reviewable change rather than a digest bump.
-FROM rust:1.98-alpine3.24@sha256:7cc1c22d77d9432f7fe012a70e6d3e555af54c2a6832700ed7d553f1769ae89f AS build
+FROM rust:1.99-alpine3.24@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d6464460028810f1627 AS build
 # ring (pulled in by rustls) builds its asm with a C toolchain + make/perl.
 RUN apk add --no-cache musl-dev gcc make perl
 WORKDIR /src
